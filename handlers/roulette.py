@@ -10,7 +10,7 @@ from sqlalchemy import select, update, delete
 from utils.crypto import generate_provably_fair_round, get_fair_winners
 from utils.image_gen import generate_gta_results
 from scheduler import scheduler
-from config import DEFAULT_TZ
+from config import DEFAULT_TZ, ADMIN_ID
 
 router = Router()
 tz_nsk = zoneinfo.ZoneInfo(DEFAULT_TZ)
@@ -20,6 +20,23 @@ def mask_username(username: str) -> str:
     if len(uname) <= 2:
         return "**"
     return "**" + uname[2:]
+
+async def is_valid_admin_team(bot: Bot, chat_id: int, user_id: int) -> bool:
+    """Проверяет, входит ли главный админ в админ-состав группы, и является ли вызывающий админом"""
+    try:
+        chat_admins = await bot.get_chat_administrators(chat_id)
+        admin_ids = [admin.user.id for admin in chat_admins]
+        
+        # 1. Защита: Главный админ ДОЛЖЕН быть в этой группе среди администраторов
+        if ADMIN_ID not in admin_ids:
+            return False
+            
+        # 2. Вызывающий команду пользователь должен быть одним из админов этой группы
+        if user_id in admin_ids:
+            return True
+    except Exception:
+        pass
+    return False
 
 async def stop_roulette_action(bot: Bot, chat_id: int):
     async with async_session() as session:
@@ -104,8 +121,8 @@ async def stop_roulette_action(bot: Bot, chat_id: int):
 @router.message(Command("рулетка"))
 @router.message(F.text.startswith("@рулетка"))
 async def start_roulette_cmd(message: Message, bot: Bot):
-    member = await bot.get_chat_member(message.chat.id, message.from_user.id)
-    if member.status not in ["administrator", "creator"]:
+    # Проверка: бот слушается только админов из разрешенной группы, где есть Главный админ
+    if not await is_valid_admin_team(bot, message.chat.id, message.from_user.id):
         return 
 
     text = message.text.replace("@рулетка", "").strip()
@@ -117,12 +134,9 @@ async def start_roulette_cmd(message: Message, bot: Bot):
     delay_minutes = 5 
     
     seed, salt, sha_hash = generate_provably_fair_round()
-    
-    # Принудительно выставляем часовой пояс Новосибирска для корректной работы на зарубежном сервере
     stop_time = datetime.datetime.now(tz_nsk) + datetime.timedelta(minutes=delay_minutes)
 
     async with async_session() as session:
-        # Для БД убираем инфо о таймзоне, чтобы SQLite не ругалась
         await session.merge(RouletteSession(
             chat_id=message.chat.id,
             is_active=True,
@@ -159,16 +173,20 @@ async def handle_chat_messages(message: Message, bot: Bot):
     if not message.text:
         return
 
-    # КРИТИЧЕСКИЙ ФИКС: Проверяем, является ли отправитель админом чата
-    user_member = await bot.get_chat_member(message.chat.id, message.from_user.id)
-    is_admin = user_member.status in ["administrator", "creator"]
-
     async with async_session() as session:
         res = await session.execute(select(RouletteSession).where(RouletteSession.chat_id == message.chat.id))
         session_data = res.scalar_one_or_none()
         
         if not session_data or not session_data.is_active:
             return
+
+        # Проверяем, админ ли тот, кто написал сообщение (чтобы случайно не удалить его текст)
+        try:
+            chat_admins = await bot.get_chat_administrators(message.chat.id)
+            admin_ids = [admin.user.id for admin in chat_admins]
+            is_admin = message.from_user.id in admin_ids
+        except Exception:
+            is_admin = False
 
         user = message.from_user
         text_clean = message.text.strip()
@@ -180,9 +198,8 @@ async def handle_chat_messages(message: Message, bot: Bot):
         participant = p_res.scalar_one_or_none()
 
         if text_clean == session_data.trigger_symbol:
-            # Админы не участвуют в рулетке по плюсу, их сообщения просто остаются как текст
             if is_admin:
-                return
+                return # Админы чата не участвуют по плюсу, их сообщения не трогаем
 
             if not user.username:
                 await message.reply(
@@ -215,9 +232,8 @@ async def handle_chat_messages(message: Message, bot: Bot):
                 return
 
         else:
-            # Если пишет НЕ плюс: админские сообщения ИГНОРИРУЕМ (оставляем), обычные — УДАЛЯЕМ
             if is_admin:
-                return
+                return # Админский текст не удаляем
 
             await message.delete() 
             
