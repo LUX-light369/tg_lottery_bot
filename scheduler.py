@@ -1,13 +1,13 @@
 import zoneinfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
-from config import DATABASE_URL, DEFAULT_TZ
+from apscheduler.jobstores.memory import MemoryJobStore
+from config import DEFAULT_TZ
 
+# Храним задачи в оперативной памяти, чтобы избежать падения с pickle/weakref
 job_stores = {
-    'default': SQLAlchemyJobStore(url=DATABASE_URL.replace("sqlite+aiosqlite", "sqlite"))
+    'default': MemoryJobStore()
 }
 
-# Передаем таймзону Новосибирска в планировщик задач
 scheduler = AsyncIOScheduler(
     jobstores=job_stores, 
     timezone=zoneinfo.ZoneInfo(DEFAULT_TZ)
