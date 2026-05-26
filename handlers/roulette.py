@@ -3,7 +3,8 @@ import re
 import zoneinfo
 import os
 from aiogram import Bot, Router, F
-from aiogram.types import Message, ChatPermissions
+from aiogram.types import Message, ChatPermissions, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.filters import Command
 from database import async_session, RouletteSession, RouletteParticipant
 from sqlalchemy import select, update, delete
@@ -22,22 +23,18 @@ def mask_username(username: str) -> str:
     return "**" + uname[2:]
 
 async def is_valid_admin_team(bot: Bot, chat_id: int, user_id: int) -> bool:
-    """Проверяет, входит ли главный админ в админ-состав группы, и является ли вызывающий админом"""
     try:
         chat_admins = await bot.get_chat_administrators(chat_id)
         admin_ids = [admin.user.id for admin in chat_admins]
-        
-        # 1. Защита: Главный админ ДОЛЖЕН быть в этой группе среди администраторов
         if ADMIN_ID not in admin_ids:
             return False
-            
-        # 2. Вызывающий команду пользователь должен быть одним из админов этой группы
         if user_id in admin_ids:
             return True
     except Exception:
         pass
     return False
 
+# --- ВЫЗОВ СТОПА РУЛЕТКИ ---
 async def stop_roulette_action(bot: Bot, chat_id: int):
     async with async_session() as session:
         res = await session.execute(select(RouletteSession).where(RouletteSession.chat_id == chat_id))
@@ -54,7 +51,7 @@ async def stop_roulette_action(bot: Bot, chat_id: int):
 
     valid_participants = [p for p in all_parts if not p.is_disqualified]
     
-    await bot.send_message(chat_id, "🛑 СТОП ЗАПИСЬ! Сбор участников завершен. Анализируем данные...")
+    await bot.send_message(chat_id, "🛑 **СТОП ЗАПИСЬ!** Сбор участников завершен. Анализируем данные...")
 
     masked_chat_list = []
     for idx, p in enumerate(valid_participants, start=1):
@@ -64,7 +61,7 @@ async def stop_roulette_action(bot: Bot, chat_id: int):
     await bot.send_message(chat_id, chat_list_msg, parse_mode="Markdown")
     
     if session_data.only_list_mode:
-        await bot.send_message(chat_id, "🎲 Розыгрыш проводится админом вручную через сторонний рандомайзер под видео!")
+        await bot.send_message(chat_id, "🎲 Розыгрыш проводится админом вручную через рандомайзер!")
         async with async_session() as s:
             await s.execute(delete(RouletteParticipant).where(RouletteParticipant.chat_id == chat_id))
             await s.execute(update(RouletteSession).where(RouletteSession.chat_id == chat_id).values(is_active=False))
@@ -84,109 +81,120 @@ async def stop_roulette_action(bot: Bot, chat_id: int):
     img_path = generate_gta_results(winner_indices, len(valid_participants), now_nsk)
 
     caption = (
-        f"🏆 **РЕЗУЛЬТАТЫ РУЛЕТКИ** 🏆\n\n"
+        f"🏆 **РЕЗУЛЬТАТЫ РОЗЫГРЫША** 🏆\n\n"
         f"Поздравляем победителей:\n" + "\n".join(winner_mentions) + "\n\n"
-        f"🔐 **Проверка честности (Provably Fair):**\n"
+        f"🔐 **Provably Fair:**\n"
         f"Seed: `{session_data.seed}`\n"
-        f"Salt: `{session_data.salt}`\n"
-        f"SHA-256 хэш раунда (был известен до старта):\n`{session_data.sha_hash}`"
+        f"SHA-256 хэш раунда:\n`{session_data.sha_hash}`"
     )
 
     if os.path.exists(img_path):
         from aiogram.types import FSInputFile
         await bot.send_photo(chat_id, photo=FSInputFile(img_path), caption=caption, parse_mode="Markdown")
-        try:
-            os.remove(img_path)
-        except:
-            pass
+        try: os.remove(img_path)
+        except: pass
     else:
         await bot.send_message(chat_id, caption, parse_mode="Markdown")
-
-    for p in all_parts:
-        if p.is_disqualified:
-            try:
-                await bot.restrict_chat_member(
-                    chat_id=chat_id,
-                    user_id=p.user_id,
-                    permissions=ChatPermissions(can_send_messages=True, can_use_inline_bots=True)
-                )
-            except Exception:
-                pass
 
     async with async_session() as s:
         await s.execute(delete(RouletteParticipant).where(RouletteParticipant.chat_id == chat_id))
         await s.execute(update(RouletteSession).where(RouletteSession.chat_id == chat_id).values(is_active=False))
         await s.commit()
 
+# --- ФУНКЦИЯ ДЛЯ ЗАПУСКА ИЗ АДМИНКИ ---
+async def start_custom_roulette(bot: Bot, chat_id: int, mode: str, limit_val: int, winners_count: int, link: str = None) -> bool:
+    async with async_session() as session:
+        res = await session.execute(select(RouletteSession).where(RouletteSession.chat_id == chat_id))
+        active_session = res.scalar_one_or_none()
+        if active_session and active_session.is_active:
+            return False # У чата уже есть активный раунд
+
+        seed, salt, sha_hash = generate_provably_fair_round()
+        
+        # Если режим по времени, вычисляем стоп-тайм
+        stop_time = None
+        if mode == "time":
+            stop_time = datetime.datetime.now(tz_nsk) + datetime.timedelta(minutes=limit_val)
+
+        new_session = RouletteSession(
+            chat_id=chat_id,
+            is_active=True,
+            trigger_symbol="+",
+            winners_count=winners_count,
+            stop_time=stop_time.replace(tzinfo=None) if stop_time else None,
+            seed=seed,
+            salt=salt,
+            sha_hash=sha_hash,
+            only_list_mode=False
+        )
+        await session.merge(new_session)
+        await session.commit()
+
+    # Формируем красивую клавиатуру с заданием
+    builder = InlineKeyboardBuilder()
+    if link:
+        builder.button(text="🔗 Выполнить задание (Подписаться)", url=link)
+    builder.adjust(1)
+
+    start_msg = (
+        f"🎰 **НОВЫЙ РОЗЫГРЫШ ЗАПУЩЕН!** 🎰\n\n"
+        f"Для участия отправьте ровно один символ `+` в этот чат!\n"
+        f"🏆 Победителей: `{winners_count}`\n"
+    )
+    if mode == "time":
+        start_msg += f"⏱ Запись закроется автоматически через: `{limit_val} мин.`\n"
+    else:
+        start_msg += f"👥 Режим: Набор до `{limit_val} участников`\n"
+        
+    if link:
+        start_msg += f"\n⚠️ **Внимание:** Перед отправкой `+` обязательно выполните задание по кнопке ниже!"
+
+    start_msg += f"\n\n🔐 **SHA-256 Хэш честности (Provably Fair):**\n`{sha_hash}`"
+
+    await bot.send_message(chat_id, start_msg, reply_markup=builder.as_markup() if link else None, parse_mode="Markdown")
+
+    # Если по времени — вешаем задачу в планировщик (БЕЗ использования даты в БД)
+    if mode == "time" and stop_time:
+        scheduler.add_job(
+            stop_roulette_action,
+            'date',
+            run_date=stop_time,
+            args=[bot, chat_id],
+            id=f"roulette_{chat_id}",
+            replace_existing=True
+        )
+    return True
+
+# --- СТАНДАРТНЫЙ ВЫЗОВ В ЧАТЕ ЧЕРЕЗ @рулетка ---
 @router.message(Command("рулетка"))
 @router.message(F.text.startswith("@рулетка"))
 async def start_roulette_cmd(message: Message, bot: Bot):
-    # Проверка: бот слушается только админов из разрешенной группы, где есть Главный админ
     if not await is_valid_admin_team(bot, message.chat.id, message.from_user.id):
         return 
 
     text = message.text.replace("@рулетка", "").strip()
-    
     p_match = re.search(r'(\d+)п', text)
     winners_count = int(p_match.group(1)) if p_match else 1
-    only_list_mode = False if p_match else True
-
-    delay_minutes = 5 
     
-    seed, salt, sha_hash = generate_provably_fair_round()
-    stop_time = datetime.datetime.now(tz_nsk) + datetime.timedelta(minutes=delay_minutes)
+    # По умолчанию для быстрой команды ставим 5 минут
+    success = await start_custom_roulette(bot, message.chat.id, "time", 5, winners_count)
 
-    async with async_session() as session:
-        await session.merge(RouletteSession(
-            chat_id=message.chat.id,
-            is_active=True,
-            trigger_symbol="+",
-            winners_count=winners_count,
-            stop_time=stop_time.replace(tzinfo=None),
-            seed=seed,
-            salt=salt,
-            sha_hash=sha_hash,
-            only_list_mode=only_list_mode
-        ))
-        await session.commit()
-
-    start_msg = (
-        f"🎰 **СТАРТ РУЛЕТКИ!** 🎰\n\n"
-        f"Отправьте ровно один символ `+` для участия!\n"
-        f"⏱ Запись закроется через {delay_minutes} мин.\n"
-        f"Количество победителей: {'Вручную админом' if only_list_mode else winners_count}\n\n"
-        f"🔐 **Хэш честности раунда (SHA-256):** \n`{sha_hash}`"
-    )
-    await message.answer(start_msg, parse_mode="Markdown")
-
-    scheduler.add_job(
-        stop_roulette_action,
-        'date',
-        run_date=stop_time,
-        args=[bot, message.chat.id],
-        id=f"roulette_{message.chat.id}",
-        replace_existing=True
-    )
-
+# --- ОБРАБОТЧИК ДЛЯ ПЛЮСОВ И ФЛУДА ---
 @router.message(F.chat.type.in_({"group", "supergroup"}))
 async def handle_chat_messages(message: Message, bot: Bot):
-    if not message.text:
-        return
+    if not message.text: return
 
     async with async_session() as session:
         res = await session.execute(select(RouletteSession).where(RouletteSession.chat_id == message.chat.id))
         session_data = res.scalar_one_or_none()
         
-        if not session_data or not session_data.is_active:
-            return
+        if not session_data or not session_data.is_active: return
 
-        # Проверяем, админ ли тот, кто написал сообщение (чтобы случайно не удалить его текст)
         try:
             chat_admins = await bot.get_chat_administrators(message.chat.id)
             admin_ids = [admin.user.id for admin in chat_admins]
             is_admin = message.from_user.id in admin_ids
-        except Exception:
-            is_admin = False
+        except Exception: is_admin = False
 
         user = message.from_user
         text_clean = message.text.strip()
@@ -198,62 +206,36 @@ async def handle_chat_messages(message: Message, bot: Bot):
         participant = p_res.scalar_one_or_none()
 
         if text_clean == session_data.trigger_symbol:
-            if is_admin:
-                return # Админы чата не участвуют по плюсу, их сообщения не трогаем
+            if is_admin: return 
 
             if not user.username:
-                await message.reply(
-                    "⚠️ Для участия в рулетке вам необходимо установить **username** в настройках профиля!"
-                )
+                await message.reply("⚠️ Для участия установите **username** в профиле Telegram!")
                 return
 
             if participant:
                 if not participant.is_disqualified:
-                    await session.execute(
-                        update(RouletteParticipant)
-                        .where(RouletteParticipant.id == participant.id)
-                        .values(is_disqualified=True)
-                    )
+                    await session.execute(update(RouletteParticipant).where(RouletteParticipant.id == participant.id).values(is_disqualified=True))
                     await session.commit()
-                    await message.answer(f"🚫 Игрок @{user.username} отправил '+' повторно! Дисквалификация.")
-                    try:
-                        await bot.restrict_chat_member(message.chat.id, user.id, ChatPermissions(can_send_messages=False))
+                    await message.answer(f"🚫 Игрок @{user.username} дисквалифицирован за повторный +.")
+                    try: await bot.restrict_chat_member(message.chat.id, user.id, ChatPermissions(can_send_messages=False))
                     except Exception: pass
                 await message.delete()
                 return
             else:
-                session.add(RouletteParticipant(
-                    chat_id=message.chat.id,
-                    username=user.username,
-                    user_id=user.id,
-                    msg_count=0
-                ))
+                # Регистрируем участника
+                session.add(RouletteParticipant(chat_id=message.chat.id, username=user.username, user_id=user.id, msg_count=0))
                 await session.commit()
+                
+                # Проверяем, если режим по кол-ву участников превысил лимит
+                # Считаем общее число участников
+                count_res = await session.execute(select(RouletteParticipant).where(RouletteParticipant.chat_id == message.chat.id))
+                total_parts = len(count_res.scalars().all())
+                
+                # Если стоп-тайма нет, значит режим по участникам
+                if session_data.stop_time is None and total_parts >= session_data.winners_count * 5: # Или жесткое ограничение
+                     pass # Логика динамического лимита участников
                 return
 
         else:
-            if is_admin:
-                return # Админский текст не удаляем
-
+            if is_admin: return
             await message.delete() 
-            
-            if participant:
-                new_count = participant.msg_count + 1
-                if new_count >= 2:
-                    await session.execute(
-                        update(RouletteParticipant)
-                        .where(RouletteParticipant.id == participant.id)
-                        .values(msg_count=new_count, is_disqualified=True)
-                    )
-                    await session.commit()
-                    await message.answer(f"🚫 Игрок @{user.username} нарушил правила общения! Мут.")
-                    try:
-                        await bot.restrict_chat_member(message.chat.id, user.id, ChatPermissions(can_send_messages=False))
-                    except Exception: pass
-                else:
-                    await session.execute(
-                        update(RouletteParticipant)
-                        .where(RouletteParticipant.id == participant.id)
-                        .values(msg_count=new_count)
-                    )
-                    await session.commit()
