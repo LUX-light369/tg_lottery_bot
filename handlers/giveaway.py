@@ -1,7 +1,9 @@
 from aiogram import Router, F, Bot
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from database import async_session, GiveawayPost, GiveawayParticipant, select, update
-from sqlalchemy import func
+# ИСПРАВЛЕНО: Чистые импорты моделей из твоей базы данных
+from database import async_session, GiveawayPost, GiveawayParticipant
+# ИСПРАВЛЕНО: select и func импортируются строго из sqlalchemy
+from sqlalchemy import select, func 
 
 router = Router()
 
@@ -19,6 +21,10 @@ async def handle_giveaway_join(callback: CallbackQuery, bot: Bot):
             
         already_in = (await s.execute(select(GiveawayParticipant).where(GiveawayParticipant.giveaway_id == post.id, GiveawayParticipant.user_id == user.id))).scalar_one_or_none()
 
+    if already_in:
+        await callback.answer("Вы уже успешно зарегистрированы в розыгрыше! 🎉", show_alert=True)
+        return
+
     # 1. Проверка обязательных подписок на каналы
     if post.channels_to_check:
         for channel in post.channels_to_check.split(","):
@@ -28,36 +34,47 @@ async def handle_giveaway_join(callback: CallbackQuery, bot: Bot):
                     await callback.answer(f"❌ Вы не подписаны на спонсорский канал @{channel.strip()}!", show_alert=True)
                     return
             except Exception:
-                pass # Если бот не админ в каком-то канале, пропускаем проверку
+                pass # Если бот не админ в каком-то канале, просто пропускаем
 
-    # 2. Имитация выполнения реф. ссылки / кастомного задания
-    if post.task_url and not callback.message.reply_markup.inline_keyboard[0][0].text.startswith("✅"):
-        # Если есть урл задания и юзер кликает первый раз — отправляем выполнять задание
+    # 2. ИСПРАВЛЕНО: Надежная проверка клика по кнопке "Проверить выполнение"
+    # Проверяем, отображается ли сейчас кнопка выполнения задания. Если да — пропускаем к регистрации.
+    current_kb = callback.message.reply_markup.inline_keyboard
+    has_task_button = any(btn.callback_data == "g_join_active" and "Проверить" in btn.text for row in current_kb for btn in row)
+
+    if post.task_url and not has_task_button:
+        # Если задание есть, но пользователь кликнул самый первый раз (кнопки проверки еще нет)
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔗 Выполнить задание", url=post.task_url)],
             [InlineKeyboardButton(text="✅ Проверить выполнение", callback_data="g_join_active")]
         ])
-        await callback.answer("Выполните кастомное задание по ссылке, затем нажмите Проверить!", show_alert=True)
-        try: await callback.message.edit_reply_markup(reply_markup=kb)
-        except: pass
+        await callback.answer("Выполните кастомное задание по ссылке, затем нажмите «Проверить выполнение»!", show_alert=True)
+        try: 
+            await callback.message.edit_reply_markup(reply_markup=kb)
+        except Exception: 
+            pass
         return
 
-    if already_in:
-        await callback.answer("Вы уже успешно зарегистрированы в розыгрыше! 🎉", show_alert=True)
-        return
-
-    # Записываем участника
+    # 3. Записываем участника в базу данных
     async with async_session() as s:
-        s.add(GiveawayParticipant(giveaway_id=post.id, user_id=user.id, username=user.username or user.first_name))
+        s.add(GiveawayParticipant(
+            giveaway_id=post.id, 
+            user_id=user.id, 
+            username=user.username or user.first_name
+        ))
         await s.commit()
         
-        # Обновляем счетчик на кнопке
+        # Получаем актуальный счетчик участников
         count = (await s.execute(select(func.count(GiveawayParticipant.id)).where(GiveawayParticipant.giveaway_id == post.id))).scalar()
 
-    # Возвращаем стандартную зеленую кнопку с новым счетчиком
+    # Возвращаем стандартную зеленую кнопку с обновленным числом участников
+    bot_info = await bot.get_me()
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🟢 Участвовать ({count})", callback_data="g_join_active")]
+        [InlineKeyboardButton(text=f"🟢 Участвовать ({count})", url=f"https://t.me/{bot_info.username}?start=g_{post.id}")]
     ])
-    try: await callback.message.edit_reply_markup(reply_markup=kb)
-    except: pass
+    
+    try: 
+        await callback.message.edit_reply_markup(reply_markup=kb)
+    except Exception: 
+        pass
+        
     await callback.answer("🎉 Успех! Вы стали участником розыгрыша.", show_alert=True)
