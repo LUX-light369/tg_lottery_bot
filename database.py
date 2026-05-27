@@ -4,7 +4,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sess
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy import BigInteger, String, Text, Boolean, DateTime, select
 
-# Укажите вашу строку подключения (из конфигурации или переменных окружения)
 from config import DATABASE_URL
 
 engine = create_async_engine(DATABASE_URL, echo=False)
@@ -18,6 +17,7 @@ class BotConfig(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     r_trigger: Mapped[str] = mapped_column(String(50), default="👍")
     r_default_prizes: Mapped[str] = mapped_column(Text, default="Приз 1, Приз 2, Приз 3")
+    r_default_duration: Mapped[int] = mapped_column(default=10) # Новое поле: время записи по умолчанию
     r_start_msg: Mapped[str] = mapped_column(Text, default="🎰 Запись на рулетку открыта! Отправьте {trigger} для участия!")
     r_stop_msg: Mapped[str] = mapped_column(Text, default="🛑 Запись на рулетку окончена! Производится расчет...")
     r_winner_template: Mapped[str] = mapped_column(Text, default="🎉 Победители рулетки:\n{winners}")
@@ -63,7 +63,7 @@ class GiveawayPost(Base):
     media_file_id: Mapped[Optional[str]] = mapped_column(String(250), nullable=True)
     channels_to_check: Mapped[str] = mapped_column(Text, default="")
     task_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    end_type: Mapped[str] = mapped_column(String(50)) # time / users
+    end_type: Mapped[str] = mapped_column(String(50))
     end_value: Mapped[str] = mapped_column(String(50))
     winners_count: Mapped[int] = mapped_column(default=1)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -75,7 +75,6 @@ class GiveawayParticipant(Base):
     user_id: Mapped[int] = mapped_column(BigInteger)
     username: Mapped[str] = mapped_column(String(100))
 
-# Новые таблицы быстрого выбора для Администратора
 class SavedTargetChat(Base):
     __tablename__ = "saved_target_chats"
     chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -89,7 +88,6 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     
-    # Первичная инициализация конфигурации
     async with async_session() as session:
         cfg = (await session.execute(select(BotConfig).where(BotConfig.id == 1))).scalar_one_or_none()
         if not cfg:
