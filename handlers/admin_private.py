@@ -21,6 +21,7 @@ class ConfigStates(StatesGroup):
     edit_winners = State()
     edit_prizes = State()
     edit_trigger = State()
+    edit_duration = State() # Новый стейт для времени записи
     add_cooldown = State()
 
 class GiveawayCreate(StatesGroup):
@@ -36,7 +37,7 @@ async def send_main_panel(message: Message):
     builder = InlineKeyboardBuilder()
     builder.button(text="⚙️ Настройки текстов Рулетки", callback_data="cfg_roulette")
     builder.button(text="🎫 Создать Розыгрыш (Giveaway)", callback_data="cfg_giveaway")
-    builder.button(text="🛑 Отмена активных Розыгрышей", callback_data="cfg_cancel_g")
+    builder.button(text="🛑 Отмена active Розыгрышей", callback_data="cfg_cancel_g")
     builder.button(text="🚫 Ограничить победителя", callback_data="cfg_cooldown")
     builder.adjust(1)
     await message.answer("🛠 **ГЛАВНАЯ ПАНЕЛЬ АДМИНИСТРАТОРА**\nВыберите модуль для настройки:", reply_markup=builder.as_markup(), parse_mode="Markdown")
@@ -46,7 +47,7 @@ async def admin_start_panel(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: 
         if message.text and message.text.startswith("/start g_"):
             g_id = int(message.text.split("g_")[1])
-            await message.answer(f"👋 Привет! Ты перешел для участия в розыгрыше #{g_id}.\nНажми кнопку «Участвовать» в канале, чтобы я зафиксировал тебя в ЛС.")
+            await message.answer(f"👋 Привет! Ты перешел для участия в розыгрыше #{g_id}.\nНажми кнопку «Участвовать» в канале.")
         return
     await state.clear()
     await send_main_panel(message)
@@ -62,12 +63,14 @@ async def cfg_roulette(callback: CallbackQuery):
     builder.button(text="📝 Шаблон победы", callback_data="edit_r_win")
     builder.button(text="🎁 Призы по умолчанию", callback_data="edit_r_prizes")
     builder.button(text="🎯 Изменить триггер", callback_data="edit_r_trigger")
+    builder.button(text="⏱ Время записи по ум.", callback_data="edit_r_duration") # Кнопка настройки времени
     builder.button(text="🔙 Назад", callback_data="back_root")
-    builder.adjust(1)
+    builder.adjust(2)
     
     status = (
         f"⚙️ **Текущие настройки рулетки:**\n\n"
         f"• **Триггер:** `{cfg.r_trigger}`\n"
+        f"• **Время записи по ум.:** `{cfg.r_default_duration} мин`\n"
         f"• **Призы по ум.:** `{cfg.r_default_prizes}`\n"
         f"• **Старт:** {cfg.r_start_msg}\n"
         f"• **Стоп:** {cfg.r_stop_msg}\n"
@@ -80,6 +83,26 @@ async def back_root(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.delete()
     await send_main_panel(callback.message)
+
+@router.callback_query(F.data == "edit_r_duration")
+async def edit_r_duration(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(ConfigStates.edit_duration)
+    await callback.message.edit_text("Введите время записи для рулетки по умолчанию (в минутах, только число):")
+
+@router.message(ConfigStates.edit_duration)
+async def save_duration(message: Message, state: FSMContext):
+    try:
+        minutes = int(message.text.strip())
+    except:
+        await message.answer("❌ Введите корректное число минут!")
+        return
+        
+    async with async_session() as s:
+        await s.execute(update(BotConfig).where(BotConfig.id == 1).values(r_default_duration=minutes))
+        await s.commit()
+    await state.clear()
+    await message.answer(f"✅ Время записи по умолчанию изменено на {minutes} мин.")
+    await send_main_panel(message)
 
 @router.callback_query(F.data == "edit_r_start")
 async def edit_r_start(callback: CallbackQuery, state: FSMContext):
@@ -149,7 +172,7 @@ async def save_trigger(message: Message, state: FSMContext):
         await s.execute(update(BotConfig).where(BotConfig.id == 1).values(r_trigger=trigger))
         await s.commit()
     await state.clear()
-    await message.answer(f"✅ Триггер изменен на `{trigger}`")
+    await message.answer(f"✅ ...Триггер изменен на `{trigger}`")
     await send_main_panel(message)
 
 # --- МЕНЮ ОТМЕНЫ АКТИВНЫХ РОЗЫГРЫШЕЙ ---
@@ -167,7 +190,7 @@ async def cancel_giveaway_menu(callback: CallbackQuery):
         builder.button(text=f"❌ Розыгрыш #{p.id} (Чат: {p.chat_id})", callback_data=f"del_g_{p.id}")
     builder.button(text="🔙 Назад", callback_data="back_root")
     builder.adjust(1)
-    await callback.message.edit_text("Выберите розыгрыш, который хотите досрочно закрыть/удалить:", reply_markup=builder.as_markup())
+    await callback.message.edit_text("Выберите розыгрыш, который хотите досрочно закрыть:", reply_markup=builder.as_markup())
 
 @router.callback_query(F.data.startswith("del_g_"))
 async def process_del_g(callback: CallbackQuery, bot: Bot):
@@ -185,17 +208,16 @@ async def process_del_g(callback: CallbackQuery, bot: Bot):
     await callback.answer("Розыгрыш успешно аннулирован!")
     await cancel_giveaway_menu(callback)
 
-# --- СОЗДАНИЕ GIVEAWAY (С БЫСТРЫМ ВЫБОРОМ) ---
+# --- СОЗДАНИЕ GIVEAWAY ---
 @router.callback_query(F.data == "cfg_giveaway")
 async def start_giveaway_fsm(callback: CallbackQuery, state: FSMContext):
     await state.set_state(GiveawayCreate.text)
-    await callback.message.edit_text("🎫 **Создание Розыгрыша.**\nОтправьте текст или полноценный пост (можно прикрепить ОДНО фото/видео):")
+    await callback.message.edit_text("🎫 **Создание Розыгрыша.**\nОтправьте текст поста:")
 
 @router.message(GiveawayCreate.text)
 async def process_g_text(message: Message, state: FSMContext):
     media_id = None
     media_type = None
-    
     if message.photo:
         media_id = message.photo[-1].file_id
         media_type = "photo"
@@ -212,51 +234,41 @@ async def process_g_text(message: Message, state: FSMContext):
     builder = InlineKeyboardBuilder()
     for ch in saved_ch:
         builder.button(text=f"📢 @{ch.username}", callback_data=f"select_ch_{ch.username}")
-    builder.button(text="❌ Без проверок подписок (0)", callback_data="select_ch_0")
+    builder.button(text="❌ Без проверок", callback_data="select_ch_0")
     builder.adjust(2)
     
     await state.set_state(GiveawayCreate.channels)
-    await message.answer(
-        "Перечислите юзернеймы каналов для Обязательной подписки через запятую (например: `chan1, chan2`).\nИли выберите сохраненные из списка ниже:",
-        reply_markup=builder.as_markup()
-    )
+    await message.answer("Укажите каналы для проверки подписок через запятую или выберите сохраненные:", reply_markup=builder.as_markup())
 
 @router.callback_query(GiveawayCreate.channels, F.data.startswith("select_ch_"))
 async def process_g_channels_callback(callback: CallbackQuery, state: FSMContext):
     ch_val = callback.data.split("select_ch_")[1]
-    channels = "" if ch_val == "0" else ch_val
-    await state.update_data(channels=channels)
+    await state.update_data(channels="" if ch_val == "0" else ch_val)
     await next_step_task(callback.message, state)
-    await callback.answer()
 
 @router.message(GiveawayCreate.channels)
 async def process_g_channels_text(message: Message, state: FSMContext):
     txt = message.text.replace("@", "").strip()
     channels = "" if txt == "0" else ",".join([c.strip() for c in txt.split(",")])
-    
     if channels:
         async with async_session() as s:
-            for c in channels.split(","):
-                await s.merge(SavedCheckChannel(username=c.strip()))
+            for c in channels.split(","): await s.merge(SavedCheckChannel(username=c.strip()))
             await s.commit()
-            
     await state.update_data(channels=channels)
     await next_step_task(message, state)
 
 async def next_step_task(message: Message, state: FSMContext):
     await state.set_state(GiveawayCreate.task)
-    await message.answer("Укажите ссылку на кастомное задание (например, реф-ссылка сайта). Если задания нет, пришлите `0`:")
+    await message.answer("Укажите ссылку на задание или отправьте `0`:")
 
 @router.message(GiveawayCreate.task)
 async def process_g_task(message: Message, state: FSMContext):
     txt = message.text.strip()
-    task = None if txt == "0" else txt
-    await state.update_data(task=task)
-    
+    await state.update_data(task=None if txt == "0" else txt)
     builder = InlineKeyboardBuilder()
-    builder.button(text="⏱ По времени записи", callback_data="g_type_time")
-    builder.button(text="👥 По количеству людей", callback_data="g_type_users")
-    await message.answer("Выберите тип завершения:", reply_markup=builder.as_markup())
+    builder.button(text="⏱ По времени", callback_data="g_type_time")
+    builder.button(text="👥 По людям", callback_data="g_type_users")
+    await message.answer("Тип завершения:", reply_markup=builder.as_markup())
 
 @router.callback_query(F.data.startswith("g_type_"))
 async def process_g_type(callback: CallbackQuery, state: FSMContext):
@@ -264,61 +276,49 @@ async def process_g_type(callback: CallbackQuery, state: FSMContext):
     await state.update_data(end_type=g_type)
     await state.set_state(GiveawayCreate.end_val)
     if g_type == "time":
-        await callback.message.edit_text("Укажите время стопа записи в формате ЧЧ:ММ (по Новосибирску):")
+        await callback.message.edit_text("Укажите время стопа (ЧЧ:ММ по НСК):")
     else:
-        await callback.message.edit_text("Сколько участников должно набраться для автоматического подведения итогов?")
+        await callback.message.edit_text("Сколько людей должно набраться?")
 
 @router.message(GiveawayCreate.end_val)
 async def process_g_val(message: Message, state: FSMContext):
     await state.update_data(end_value=message.text.strip())
     await state.set_state(GiveawayCreate.winners)
-    await message.answer("Укажите число победителей:")
+    await message.answer("Число победителей:")
 
 @router.message(GiveawayCreate.winners)
 async def process_g_winners(message: Message, state: FSMContext):
     try: winners_count = int(message.text.strip())
-    except:
-        await message.answer("Введите число!")
-        return
+    except: return
     await state.update_data(winners=winners_count)
     
     async with async_session() as s:
         saved_chats = (await s.execute(select(SavedTargetChat))).scalars().all()
-        
     builder = InlineKeyboardBuilder()
-    for sc in saved_chats:
-        builder.button(text=f"💬 {sc.title}", callback_data=f"select_target_{sc.chat_id}")
+    for sc in saved_chats: builder.button(text=f"💬 {sc.title}", callback_data=f"select_target_{sc.chat_id}")
     builder.adjust(1)
     
     await state.set_state(GiveawayCreate.target_chat)
-    await message.answer(
-        "Отправьте ID группы/канала (числовой с минусом), куда опубликовать пост, или выберите из сохраненных:",
-        reply_markup=builder.as_markup()
-    )
+    await message.answer("ID целевого чата/канала для публикации:", reply_markup=builder.as_markup())
 
 @router.callback_query(GiveawayCreate.target_chat, F.data.startswith("select_target_"))
 async def process_g_target_callback(callback: CallbackQuery, state: FSMContext, bot: Bot):
     chat_id = int(callback.data.split("select_target_")[2])
     await finalize_giveaway(chat_id, callback.message, state, bot)
-    await callback.answer()
 
 @router.message(GiveawayCreate.target_chat)
 async def process_g_target_text(message: Message, state: FSMContext, bot: Bot):
     try: chat_id = int(message.text.strip())
-    except:
-        await message.answer("Неверный формат ID чата.")
-        return
+    except: return
     await finalize_giveaway(chat_id, message, state, bot)
 
 async def finalize_giveaway(chat_id: int, message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     bot_info = await bot.get_me()
-    
     try:
         chat_info = await bot.get_chat(chat_id)
-        chat_title = chat_info.title or f"Чат {chat_id}"
         async with async_session() as s:
-            await s.merge(SavedTargetChat(chat_id=chat_id, title=chat_title))
+            await s.merge(SavedTargetChat(chat_id=chat_id, title=chat_info.title or f"Чат {chat_id}"))
             await s.commit()
     except: pass
     
@@ -331,33 +331,28 @@ async def finalize_giveaway(chat_id: int, message: Message, state: FSMContext, b
         )
         s.add(new_post)
         await s.flush()
-        g_id = new_post.id
         
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🟢 Участвовать (0)", url=f"https://t.me/{bot_info.username}?start=g_{g_id}")]
+            [InlineKeyboardButton(text="🟢 Участвовать (0)", url=f"https://t.me/{bot_info.username}?start=g_{new_post.id}")]
         ])
         
-        sent_msg = None
         if data['media_id']:
-            if data['media_type'] == "photo":
-                sent_msg = await bot.send_photo(chat_id, photo=data['media_id'], caption=data['text'], reply_markup=kb, parse_mode="HTML")
-            elif data['media_type'] == "video":
-                sent_msg = await bot.send_video(chat_id, video=data['media_id'], caption=data['text'], reply_markup=kb, parse_mode="HTML")
+            if data['media_type'] == "photo": sent_msg = await bot.send_photo(chat_id, photo=data['media_id'], caption=data['text'], reply_markup=kb, parse_mode="HTML")
+            else: sent_msg = await bot.send_video(chat_id, video=data['media_id'], caption=data['text'], reply_markup=kb, parse_mode="HTML")
         else:
             sent_msg = await bot.send_message(chat_id, text=data['text'], reply_markup=kb, parse_mode="HTML")
             
         new_post.message_id = sent_msg.message_id
         await s.commit()
-        
     await state.clear()
-    await message.answer("🚀 Пост розыгрыша успешно опубликован!")
+    await message.answer("🚀 Розыгрыш опубликован!")
     await send_main_panel(message)
 
 # --- БЛОК ОГРАНИЧЕНИЙ ---
 @router.callback_query(F.data == "cfg_cooldown")
 async def cfg_cooldown(callback: CallbackQuery, state: FSMContext):
     await state.set_state(ConfigStates.add_cooldown)
-    await callback.message.edit_text("Введите юзернейм игрока и количество дней бана через пробел:\nПример: `UserVasya 7`")
+    await callback.message.edit_text("Юзернейм игрока и число дней бана через пробел:")
 
 @router.message(ConfigStates.add_cooldown)
 async def save_cooldown(message: Message, state: FSMContext):
@@ -365,15 +360,11 @@ async def save_cooldown(message: Message, state: FSMContext):
         username, days = message.text.split()
         username = username.lstrip("@").strip()
         days_int = int(days)
-    except:
-        await message.answer("❌ Ошибка ввода. Формат: `ИмяПользователя ЧислоДней`")
-        return
-        
+    except: return
     until = datetime.datetime.now(tz_nsk) + datetime.timedelta(days=days_int)
     async with async_session() as s:
         await s.merge(WinnerCooldown(username=username, until_date=until.replace(tzinfo=None)))
         await s.commit()
-        
     await state.clear()
-    await message.answer(f"✅ Игрок @{username} заблокирован на {days_int} дней.")
+    await message.answer("✅ Бан сохранен.")
     await send_main_panel(message)
