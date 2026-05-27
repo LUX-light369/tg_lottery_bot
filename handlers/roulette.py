@@ -22,17 +22,48 @@ from config import DEFAULT_TZ, ADMIN_ID
 router = Router()
 tz_nsk = zoneinfo.ZoneInfo(DEFAULT_TZ)
 
-# --- АНОНС И СТАРТ ОТЛОЖЕННОЙ РУЛЕТКИ ---
-async def start_recording_now(bot: Bot, chat_id: int):
+def clean_compare(str1: str, str2: str) -> bool:
+    if not str1 or not str2: return False
+    return str1.strip().encode('utf-8') == str2.strip().encode('utf-8')
+
+async def start_recording_now(bot: Bot, chat_id: int, duration_minutes: int = 10):
     async with async_session() as s:
         cfg = (await s.execute(select(BotConfig).where(BotConfig.id == 1))).scalar_one()
         await s.execute(update(RouletteSession).where(RouletteSession.chat_id == chat_id).values(is_joined_active=True))
         await s.commit()
     
-    msg = cfg.r_start_msg.format(trigger=f"'{cfg.r_trigger}'")
+    msg = cfg.r_start_msg.format(trigger=f" {cfg.r_trigger} ")
     await bot.send_message(chat_id, msg, parse_mode="HTML")
 
-# --- КОМАНДА @рулетка Хп ЧЧ:ММ ---
+# --- КОМАНДА ОТМЕНЫ РУЛЕТКИ ---
+@router.message(F.chat.type.in_({"group", "supergroup"}))
+@router.message(Command("отмена"))
+async def cancel_roulette_cmd(message: Message, bot: Bot):
+    if not (message.text and ("@отмена" in message.text or message.text.startswith("/отмена"))): return
+    
+    try:
+        admins = [a.user.id for a in await bot.get_chat_administrators(message.chat.id)]
+        if message.from_user.id not in admins and message.from_user.id != ADMIN_ID: return
+    except: return
+
+    async with async_session() as s:
+        session_data = (await s.execute(select(RouletteSession).where(RouletteSession.chat_id == message.chat.id))).scalar_one_or_none()
+        if not session_data or not session_data.is_active:
+            await message.reply("❌ В данном чате нет активной запущенной рулетки.")
+            return
+            
+        await s.execute(delete(RouletteSession).where(RouletteSession.chat_id == message.chat.id))
+        await s.execute(delete(RouletteParticipant).where(RouletteParticipant.chat_id == message.chat.id))
+        await s.commit()
+
+    for job in scheduler.get_jobs():
+        if job.args and len(job.args) > 1 and job.args[1] == message.chat.id:
+            try: job.remove()
+            except: pass
+
+    await message.answer("🛑 **Запись рулетки принудительно отменена администратором!** База данных раунда очищена.")
+
+# --- ЗАПУСК РУЛЕТКИ С УЧЕТОМ ТАЙМИНГОВ ---
 @router.message(F.chat.type.in_({"group", "supergroup"}))
 @router.message(Command("рулетка"))
 async def process_roulette_cmd(message: Message, bot: Bot):
@@ -44,13 +75,19 @@ async def process_roulette_cmd(message: Message, bot: Bot):
     except: return
 
     text = message.text.replace("@рулетка", "").replace("/рулетка", "").strip()
+    
+    # Парсинг параметров: пример "/рулетка 3п 15м" или "/рулетка 2п 23:15"
     p_match = re.search(r'(\d+)п', text)
     t_match = re.search(r'(\d{2}:\d{2})', text)
+    m_match = re.search(r'(\d+)м', text)
     
     winners_count = int(p_match.group(1)) if p_match else 1
-    prizes_list = text.split(p_match.group(0))[-1].strip() if p_match else "Приз"
-    if t_match:
-        prizes_list = prizes_list.replace(t_match.group(0), "").strip()
+    duration_minutes = int(m_match.group(1)) if m_match else 10
+    
+    prizes_list = text
+    for m in [p_match, t_match, m_match]:
+        if m: prizes_list = prizes_list.replace(m.group(0), "")
+    prizes_list = prizes_list.strip()
 
     async with async_session() as s:
         cfg = (await s.execute(select(BotConfig).where(BotConfig.id == 1))).scalar_one()
@@ -71,10 +108,6 @@ async def process_roulette_cmd(message: Message, bot: Bot):
         s.add(session_data)
         await s.commit()
 
-    prizes_split = [p.strip() for p in prizes_list.split(",") if p.strip()]
-    if len(prizes_split) > 1 and len(prizes_split) < winners_count:
-        await bot.send_message(ADMIN_ID, f"⚠️ **Внимание:** В рулетке чата `{message.chat.id}` указано {winners_count} мест, но всего {len(prizes_split)} призов! Добавьте призы.")
-
     if t_match:
         target_time_str = t_match.group(1)
         now = datetime.datetime.now(tz_nsk)
@@ -84,15 +117,15 @@ async def process_roulette_cmd(message: Message, bot: Bot):
         if run_date < now:
             run_date += datetime.timedelta(days=1)
             
-        await message.answer(f"📢 **Рулетка запланирована!**\nКоличество мест: `{winners_count}`\nПризы: `{prizes_list or cfg.r_default_prizes}`\nЗапись начнется автоматически в **{target_time_str}** по НСК.\n\n🔐 SHA-256 хэш честности:\n`{sha_hash}`", parse_mode="Markdown")
+        await message.answer(f"📢 **Рулетка запланирована!**\n🏆 Количество мест: `{winners_count}`\n⏱ Длительность записи: `{duration_minutes} мин`\nЗапись начнется автоматически в **{target_time_str}** по НСК.\n\n🔐 SHA-256 хэш честности:\n`{sha_hash}`", parse_mode="Markdown")
         
-        scheduler.add_job(start_recording_now, 'date', run_date=run_date, args=[bot, message.chat.id])
-        scheduler.add_job(stop_roulette_action, 'date', run_date=run_date + datetime.timedelta(minutes=10), args=[bot, message.chat.id])
+        scheduler.add_job(start_recording_now, 'date', run_date=run_date, args=[bot, message.chat.id, duration_minutes])
+        scheduler.add_job(stop_roulette_action, 'date', run_date=run_date + datetime.timedelta(minutes=duration_minutes), args=[bot, message.chat.id])
     else:
-        await message.answer(f"🎰 **Рулетка запущена!**\nОтправляйте триггер `{cfg.r_trigger}` для участия!\n🏆 Мест: `{winners_count}`\n🔐 SHA-256 раунда:\n`{sha_hash}`", parse_mode="Markdown")
-        scheduler.add_job(stop_roulette_action, 'date', run_date=datetime.datetime.now(tz_nsk) + datetime.timedelta(minutes=5), args=[bot, message.chat.id])
+        await message.answer(f"🎰 **Рулетка запущена!**\nОтправляйте триггер `{cfg.r_trigger}` для участия!\n🏆 Призовых мест: `{winners_count}`\n⏱ Время на запись: `{duration_minutes} мин`\n🔐 SHA-256 раунда:\n`{sha_hash}`", parse_mode="Markdown")
+        scheduler.add_job(stop_roulette_action, 'date', run_date=datetime.datetime.now(tz_nsk) + datetime.timedelta(minutes=duration_minutes), args=[bot, message.chat.id])
 
-# --- СТОП ЗАПИСИ И ПОДВЕДЕНИЕ ИТОГОВ ---
+# --- СТОП РУЛЕТКИ И РАСЧЕТ ---
 async def stop_roulette_action(bot: Bot, chat_id: int):
     async with async_session() as s:
         session_data = (await s.execute(select(RouletteSession).where(RouletteSession.chat_id == chat_id))).scalar_one_or_none()
@@ -100,30 +133,17 @@ async def stop_roulette_action(bot: Bot, chat_id: int):
         
         cfg = (await s.execute(select(BotConfig).where(BotConfig.id == 1))).scalar_one()
         parts = (await s.execute(select(RouletteParticipant).where(RouletteParticipant.chat_id == chat_id, RouletteParticipant.is_disqualified == False))).scalars().all()
-        
         cooldowns = (await s.execute(select(WinnerCooldown).where(WinnerCooldown.until_date > datetime.datetime.utcnow()))).scalars().all()
         banned_names = [c.username for c in cooldowns]
-        
         valid_parts = [p for p in parts if p.username not in banned_names]
 
     await bot.send_message(chat_id, cfg.r_stop_msg, parse_mode="HTML")
 
-    # Списки без @ в чат
-    chat_list = [f"{idx}. {p.username}" for idx, p in enumerate(valid_parts, start=1)]
-    await bot.send_message(chat_id, "📋 **Список участников:**\n" + ("\n".join(chat_list) if chat_list else "Пусто."), parse_mode="Markdown")
-    
-    # Список админу в ЛС с кликабельным @
-    admin_list = [f"{idx}. @{p.username} (ID: {p.user_id})" for idx, p in enumerate(valid_parts, start=1)]
-    try:
-        await bot.send_message(ADMIN_ID, f"📋 Список участников рулетки в чате `{chat_id}`:\n" + "\n".join(admin_list))
-    except: pass
-
     if not valid_parts:
-        await bot.send_message(chat_id, "🤷‍♂️ Победителей выбрать невозможно, участников нет.")
+        await bot.send_message(chat_id, "🤷‍♂️ Время записи вышло. Победителей выбрать невозможно, валидных участников нет.")
         return
 
     winners = get_fair_winners(valid_parts, session_data.winners_count, session_data.seed, session_data.salt)
-    
     prizes_split = [p.strip() for p in session_data.prizes.split(",") if p.strip()]
     winner_mentions = []
     
@@ -133,7 +153,6 @@ async def stop_roulette_action(bot: Bot, chat_id: int):
 
     now_str = datetime.datetime.now(tz_nsk).strftime("%d.%m.%Y %H:%M")
     img_path = generate_gta_results([valid_parts.index(w)+1 for w in winners], len(valid_parts), now_str)
-    
     caption = cfg.r_winner_template.format(winners="\n".join(winner_mentions), default_prizes=session_data.prizes)
     
     if os.path.exists(img_path):
@@ -144,18 +163,6 @@ async def stop_roulette_action(bot: Bot, chat_id: int):
     else:
         await bot.send_message(chat_id, caption, parse_mode="HTML")
 
-    verify_msg = (
-        f"🔐 **ПРОВЕРКА ЧЕСТНОСТИ (Provably Fair)**\n\n"
-        f"• SHA-256 хэш раунда: `{session_data.sha_hash}`\n"
-        f"• Начальный Seed: `{session_data.seed}`\n"
-        f"• Соль (Salt): `{session_data.salt}`\n\n"
-        f"📝 **Инструкция проверки:**\n"
-        f"1. Возьмите Seed и строку соли.\n"
-        f"2. Объедините их через двоеточие и закодируйте в SHA-256 на любом независимом сайте (например md5calc.com).\n"
-        f"3. Вы получите Хэш, полностью совпадающий с опубликованным до старта!"
-    )
-    await bot.send_message(chat_id, verify_msg, parse_mode="Markdown")
-
     async with async_session() as s:
         p_json = json.dumps([{"user_id": p.user_id, "username": p.username} for p in valid_parts])
         w_json = json.dumps([{"user_id": w.user_id, "username": w.username} for w in winners])
@@ -164,7 +171,7 @@ async def stop_roulette_action(bot: Bot, chat_id: int):
         await s.execute(update(RouletteSession).where(RouletteSession.chat_id == chat_id).values(is_active=False))
         await s.commit()
 
-# --- СБОР СИМВОЛОВ ЗАПИСИ (ПЛЮСОВ) ---
+# --- СБОР ТРИГГЕРОВ ---
 @router.message(F.chat.type.in_({"group", "supergroup"}))
 async def collect_triggers(message: Message, bot: Bot):
     if not message.text: return
@@ -174,9 +181,9 @@ async def collect_triggers(message: Message, bot: Bot):
         if not session_data or not session_data.is_active or not session_data.is_joined_active: return
         cfg = (await s.execute(select(BotConfig).where(BotConfig.id == 1))).scalar_one()
 
-    if message.text.strip() == cfg.r_trigger:
+    if clean_compare(message.text, cfg.r_trigger):
         if not message.from_user.username:
-            await message.reply("⚠️ Для участия пропишите @username в настройках аккаунта Telegram!")
+            await message.reply("⚠️ Пропишите @username в профиле Telegram для участия в рулетке!")
             return
             
         async with async_session() as s:
@@ -185,55 +192,11 @@ async def collect_triggers(message: Message, bot: Bot):
                 if not exist.is_disqualified:
                     await s.execute(update(RouletteParticipant).where(RouletteParticipant.id == exist.id).values(is_disqualified=True))
                     await s.commit()
-                    await message.answer(f"🚫 Игрок {message.from_user.username} дисквалифицирован за дублирование триггера!")
-                await message.delete()
+                    await message.answer(f"🚫 Игрок @{message.from_user.username} дисквалифицирован за спам триггером!")
+                try: await message.delete()
+                except: pass
                 return
             
             s.add(RouletteParticipant(chat_id=message.chat.id, user_id=message.from_user.id, username=message.from_user.username))
             await s.commit()
             return
-    else:
-        try: await message.delete()
-        except: pass
-
-# --- МЕХАНИКА @перекрут ---
-@router.message(F.text.startswith("@перекрут"))
-async def process_reroll(message: Message, bot: Bot):
-    try:
-        admins = [a.user.id for a in await bot.get_chat_administrators(message.chat.id)]
-        if message.from_user.id not in admins and message.from_user.id != ADMIN_ID: return
-    except: return
-
-    places = [int(p.replace("п","")) for p in re.findall(r'\d+п', message.text)]
-    if not places: return
-
-    async with async_session() as s:
-        round_data = (await s.execute(select(PastRouletteRound).where(PastRouletteRound.chat_id == message.chat.id))).scalar_one_or_none()
-        
-    if not round_data or (datetime.datetime.utcnow() - round_data.updated_at).total_seconds() > 86400:
-        await message.reply("❌ Прошло более 24 часов или сессий рулетки не найдено!")
-        return
-
-    parts = json.loads(round_data.participants_json)
-    past_winners = json.loads(round_data.winners_json)
-    
-    banned_ids = [w['user_id'] for w in past_winners]
-    pool = [p for p in parts if p['user_id'] not in banned_ids]
-    
-    if not pool:
-        await message.reply("❌ Недостаточно уникальных участников для перекрута!")
-        return
-
-    new_winners = past_winners.copy()
-    for p_idx in places:
-        if p_idx <= len(new_winners):
-            new_candidate = random.choice(pool)
-            pool.remove(new_candidate)
-            new_winners[p_idx-1] = new_candidate
-
-    async with async_session() as s:
-        await s.execute(update(PastRouletteRound).where(PastRouletteRound.chat_id == message.chat.id).values(winners_json=json.dumps(new_winners)))
-        await s.commit()
-
-    mentions = [f"🏆 Место #{i+1}: @{w['username']}" for i, w in enumerate(new_winners)]
-    await message.answer("🔄 **ПЕРЕКРУТ ЗАВЕРШЕН!** Обновленный список мест:\n\n" + "\n".join(mentions), parse_mode="Markdown")
