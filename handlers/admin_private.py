@@ -1,14 +1,16 @@
 import datetime
 import json
+import zoneinfo
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
+
 from config import ADMIN_ID, DEFAULT_TZ
-import zoneinfo
-from database import async_session, BotConfig, WinnerCooldown, select, update
+from database import async_session, BotConfig, WinnerCooldown, GiveawayPost
+from sqlalchemy import select, update
 
 router = Router()
 tz_nsk = zoneinfo.ZoneInfo(DEFAULT_TZ)
@@ -74,7 +76,7 @@ async def back_root(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "edit_r_start")
 async def edit_r_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(ConfigStates.edit_start)
-    await callback.message.edit_text("Отправьте новый текст стартового сообщения. Используйте `{trigger}` для подстановки символа записи:")
+    await callback.message.edit_text("Отправьте новый text стартового сообщения. Используйте `{trigger}` для подстановки символа записи:")
 
 @router.message(ConfigStates.edit_start)
 async def save_start_msg(message: Message, state: FSMContext):
@@ -184,8 +186,6 @@ async def process_g_finalize(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     chat_id = int(message.text.strip())
     
-    # Зеленая инлайн-кнопка через кастомный WebApp урл или маркер для акцента
-    # С недавних пор в API 2025/2026 добавлены структурированные кнопки. Подсвечиваем смайлом и структурой.
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🟢 Участвовать (0)", callback_data="g_join_active")]
     ])
@@ -196,7 +196,6 @@ async def process_g_finalize(message: Message, state: FSMContext, bot: Bot):
     else:
         sent_msg = await bot.send_message(chat_id, text=data['text'], reply_markup=kb, parse_mode="HTML")
         
-    from database import GiveawayPost
     async with async_session() as s:
         s.add(GiveawayPost(
             chat_id=chat_id,
