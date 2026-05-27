@@ -21,7 +21,7 @@ class ConfigStates(StatesGroup):
     edit_winners = State()
     edit_prizes = State()
     edit_trigger = State()
-    edit_duration = State() # Новый стейт для времени записи
+    edit_duration = State() # Шаг FSM для времени записи по умолчанию
     add_cooldown = State()
 
 class GiveawayCreate(StatesGroup):
@@ -63,7 +63,7 @@ async def cfg_roulette(callback: CallbackQuery):
     builder.button(text="📝 Шаблон победы", callback_data="edit_r_win")
     builder.button(text="🎁 Призы по умолчанию", callback_data="edit_r_prizes")
     builder.button(text="🎯 Изменить триггер", callback_data="edit_r_trigger")
-    builder.button(text="⏱ Время записи по ум.", callback_data="edit_r_duration") # Кнопка настройки времени
+    builder.button(text="⏱ Время записи по ум.", callback_data="edit_r_duration")
     builder.button(text="🔙 Назад", callback_data="back_root")
     builder.adjust(2)
     
@@ -111,8 +111,10 @@ async def edit_r_start(callback: CallbackQuery, state: FSMContext):
 
 @router.message(ConfigStates.edit_start)
 async def save_start_msg(message: Message, state: FSMContext):
+    # Безопасное извлечение форматирования во избежание None значений
+    text_to_save = message.html_text or message.text or ""
     async with async_session() as s:
-        await s.execute(update(BotConfig).where(BotConfig.id == 1).values(r_start_msg=message.html_text or message.text))
+        await s.execute(update(BotConfig).where(BotConfig.id == 1).values(r_start_msg=text_to_save))
         await s.commit()
     await state.clear()
     await message.answer("✅ Шаблон стартового сообщения обновлен!")
@@ -125,8 +127,10 @@ async def edit_r_stop(callback: CallbackQuery, state: FSMContext):
 
 @router.message(ConfigStates.edit_stop)
 async def save_stop_msg(message: Message, state: FSMContext):
+    # Безопасное извлечение форматирования во избежание None значений
+    text_to_save = message.html_text or message.text or ""
     async with async_session() as s:
-        await s.execute(update(BotConfig).where(BotConfig.id == 1).values(r_stop_msg=message.html_text or message.text))
+        await s.execute(update(BotConfig).where(BotConfig.id == 1).values(r_stop_msg=text_to_save))
         await s.commit()
     await state.clear()
     await message.answer("✅ Шаблон сообщения стопа обновлен!")
@@ -139,8 +143,10 @@ async def edit_r_win(callback: CallbackQuery, state: FSMContext):
 
 @router.message(ConfigStates.edit_winners)
 async def save_win_msg(message: Message, state: FSMContext):
+    # Безопасное извлечение форматирования во избежание None значений
+    text_to_save = message.html_text or message.text or ""
     async with async_session() as s:
-        await s.execute(update(BotConfig).where(BotConfig.id == 1).values(r_winner_template=message.html_text or message.text))
+        await s.execute(update(BotConfig).where(BotConfig.id == 1).values(r_winner_template=text_to_save))
         await s.commit()
     await state.clear()
     await message.answer("✅ Шаблон блока победителей сохранен!")
@@ -172,7 +178,7 @@ async def save_trigger(message: Message, state: FSMContext):
         await s.execute(update(BotConfig).where(BotConfig.id == 1).values(r_trigger=trigger))
         await s.commit()
     await state.clear()
-    await message.answer(f"✅ ...Триггер изменен на `{trigger}`")
+    await message.answer(f"✅ Триггер изменен на `{trigger}`")
     await send_main_panel(message)
 
 # --- МЕНЮ ОТМЕНЫ АКТИВНЫХ РОЗЫГРЫШЕЙ ---
