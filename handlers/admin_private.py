@@ -9,7 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 
 from config import ADMIN_ID, DEFAULT_TZ
-from database import async_session, BotConfig, WinnerCooldown, GiveawayPost
+from database import async_session, BotConfig, WinnerCooldown, GiveawayPost, SavedTargetChat, SavedCheckChannel
 from sqlalchemy import select, update, delete
 
 router = Router()
@@ -44,7 +44,6 @@ async def send_main_panel(message: Message):
 @router.message(CommandStart(), F.chat.type == "private")
 async def admin_start_panel(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: 
-        # Проверяем, не перешел ли обычный юзер по реф-ссылке розыгрыша
         if message.text and message.text.startswith("/start g_"):
             g_id = int(message.text.split("g_")[1])
             await message.answer(f"👋 Привет! Ты перешел для участия в розыгрыше #{g_id}.\nНажми кнопку «Участвовать» в канале, чтобы я зафиксировал тебя в ЛС.")
@@ -82,7 +81,6 @@ async def back_root(callback: CallbackQuery, state: FSMContext):
     await callback.message.delete()
     await send_main_panel(callback.message)
 
-# Хэндлеры изменения настроек
 @router.callback_query(F.data == "edit_r_start")
 async def edit_r_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(ConfigStates.edit_start)
@@ -154,7 +152,7 @@ async def save_trigger(message: Message, state: FSMContext):
     await message.answer(f"✅ Триггер изменен на `{trigger}`")
     await send_main_panel(message)
 
-# --- УПРАВЛЕНИЕ И ОТМЕНА РОЗЫГРЫШЕЙ ---
+# --- МЕНЮ ОТМЕНЫ АКТИВНЫХ РОЗЫГРЫШЕЙ ---
 @router.callback_query(F.data == "cfg_cancel_g")
 async def cancel_giveaway_menu(callback: CallbackQuery):
     async with async_session() as s:
@@ -187,7 +185,7 @@ async def process_del_g(callback: CallbackQuery, bot: Bot):
     await callback.answer("Розыгрыш успешно аннулирован!")
     await cancel_giveaway_menu(callback)
 
-# --- СОЗДАНИЕ GIVEAWAY (УЛУЧШЕННОЕ МЕДИА) ---
+# --- СОЗДАНИЕ GIVEAWAY (С БЫСТРЫМ ВЫБОРОМ) ---
 @router.callback_query(F.data == "cfg_giveaway")
 async def start_giveaway_fsm(callback: CallbackQuery, state: FSMContext):
     await state.set_state(GiveawayCreate.text)
@@ -206,16 +204,46 @@ async def process_g_text(message: Message, state: FSMContext):
         media_type = "video"
         
     text_content = message.html_text or message.text or ""
-    
     await state.update_data(text=text_content, media_id=media_id, media_type=media_type)
+    
+    async with async_session() as s:
+        saved_ch = (await s.execute(select(SavedCheckChannel))).scalars().all()
+        
+    builder = InlineKeyboardBuilder()
+    for ch in saved_ch:
+        builder.button(text=f"📢 @{ch.username}", callback_data=f"select_ch_{ch.username}")
+    builder.button(text="❌ Без проверок подписок (0)", callback_data="select_ch_0")
+    builder.adjust(2)
+    
     await state.set_state(GiveawayCreate.channels)
-    await message.answer("Перечислите юзернеймы каналов для Обязательной подписки через запятую (например: `chan1, chan2`). Если не нужно, пришлите `0`:")
+    await message.answer(
+        "Перечислите юзернеймы каналов для Обязательной подписки через запятую (например: `chan1, chan2`).\nИли выберите сохраненные из списка ниже:",
+        reply_markup=builder.as_markup()
+    )
+
+@router.callback_query(GiveawayCreate.channels, F.data.startswith("select_ch_"))
+async def process_g_channels_callback(callback: CallbackQuery, state: FSMContext):
+    ch_val = callback.data.split("select_ch_")[1]
+    channels = "" if ch_val == "0" else ch_val
+    await state.update_data(channels=channels)
+    await next_step_task(callback.message, state)
+    await callback.answer()
 
 @router.message(GiveawayCreate.channels)
-async def process_g_channels(message: Message, state: FSMContext):
+async def process_g_channels_text(message: Message, state: FSMContext):
     txt = message.text.replace("@", "").strip()
     channels = "" if txt == "0" else ",".join([c.strip() for c in txt.split(",")])
+    
+    if channels:
+        async with async_session() as s:
+            for c in channels.split(","):
+                await s.merge(SavedCheckChannel(username=c.strip()))
+            await s.commit()
+            
     await state.update_data(channels=channels)
+    await next_step_task(message, state)
+
+async def next_step_task(message: Message, state: FSMContext):
     await state.set_state(GiveawayCreate.task)
     await message.answer("Укажите ссылку на кастомное задание (например, реф-ссылка сайта). Если задания нет, пришлите `0`:")
 
@@ -248,46 +276,63 @@ async def process_g_val(message: Message, state: FSMContext):
 
 @router.message(GiveawayCreate.winners)
 async def process_g_winners(message: Message, state: FSMContext):
-    try:
-        winners_count = int(message.text.strip())
+    try: winners_count = int(message.text.strip())
     except:
         await message.answer("Введите число!")
         return
     await state.update_data(winners=winners_count)
+    
+    async with async_session() as s:
+        saved_chats = (await s.execute(select(SavedTargetChat))).scalars().all()
+        
+    builder = InlineKeyboardBuilder()
+    for sc in saved_chats:
+        builder.button(text=f"💬 {sc.title}", callback_data=f"select_target_{sc.chat_id}")
+    builder.adjust(1)
+    
     await state.set_state(GiveawayCreate.target_chat)
-    await message.answer("Отправьте ID группы/канала (числовой с минусом), куда опубликовать пост:")
+    await message.answer(
+        "Отправьте ID группы/канала (числовой с минусом), куда опубликовать пост, или выберите из сохраненных:",
+        reply_markup=builder.as_markup()
+    )
+
+@router.callback_query(GiveawayCreate.target_chat, F.data.startswith("select_target_"))
+async def process_g_target_callback(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    chat_id = int(callback.data.split("select_target_")[2])
+    await finalize_giveaway(chat_id, callback.message, state, bot)
+    await callback.answer()
 
 @router.message(GiveawayCreate.target_chat)
-async def process_g_finalize(message: Message, state: FSMContext, bot: Bot):
-    data = await state.get_data()
-    try:
-        chat_id = int(message.text.strip())
+async def process_g_target_text(message: Message, state: FSMContext, bot: Bot):
+    try: chat_id = int(message.text.strip())
     except:
         await message.answer("Неверный формат ID чата.")
         return
-    
-    # Получаем юзернейм текущего бота для диплинка
+    await finalize_giveaway(chat_id, message, state, bot)
+
+async def finalize_giveaway(chat_id: int, message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
     bot_info = await bot.get_me()
     
+    try:
+        chat_info = await bot.get_chat(chat_id)
+        chat_title = chat_info.title or f"Чат {chat_id}"
+        async with async_session() as s:
+            await s.merge(SavedTargetChat(chat_id=chat_id, title=chat_title))
+            await s.commit()
+    except: pass
+    
     async with async_session() as s:
-        # Сначала сохраняем запись в БД, чтобы получить уникальный ID розыгрыша
         new_post = GiveawayPost(
-            chat_id=chat_id,
-            message_id=0,
-            text_data=data['text'],
-            media_file_id=data['media_id'],
-            channels_to_check=data['channels'],
-            task_url=data['task'],
-            end_type=data['end_type'],
-            end_value=data['end_value'],
-            winners_count=data['winners'],
-            is_active=True
+            chat_id=chat_id, message_id=0, text_data=data['text'],
+            media_file_id=data['media_id'], channels_to_check=data['channels'],
+            task_url=data['task'], end_type=data['end_type'],
+            end_value=data['end_value'], winners_count=data['winners'], is_active=True
         )
         s.add(new_post)
         await s.flush()
         g_id = new_post.id
         
-        # Кнопка ведет в ЛС бота по диплинку
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🟢 Участвовать (0)", url=f"https://t.me/{bot_info.username}?start=g_{g_id}")]
         ])
