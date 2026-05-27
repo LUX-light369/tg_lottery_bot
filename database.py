@@ -53,4 +53,36 @@ class PastRouletteRound(Base):
 class GiveawayPost(Base):
     __tablename__ = "giveaway_posts"
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    chat_id: Mapped[int] = mapped_
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    message_id: Mapped[int] = mapped_column(Integer)
+    text_data: Mapped[str] = mapped_column(Text)
+    media_file_id: Mapped[str] = mapped_column(String(500), nullable=True)
+    channels_to_check: Mapped[str] = mapped_column(Text, default="") # Каналы через запятую
+    task_url: Mapped[str] = mapped_column(Text, nullable=True)
+    end_type: Mapped[str] = mapped_column(String(50)) # "time" или "users"
+    end_value: Mapped[str] = mapped_column(String(100))
+    winners_count: Mapped[int] = mapped_column(Integer, default=1)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+class GiveawayParticipant(Base):
+    __tablename__ = "giveaway_participants"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    giveaway_id: Mapped[int] = mapped_column(Integer)
+    user_id: Mapped[int] = mapped_column(BigInteger)
+    username: Mapped[str] = mapped_column(String(200))
+
+class WinnerCooldown(Base):
+    __tablename__ = "winner_cooldowns"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    username: Mapped[str] = mapped_column(String(200), unique=True)
+    until_date: Mapped[datetime.datetime] = mapped_column(DateTime)
+
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    
+    async with async_session() as session:
+        res = await session.execute(select(BotConfig).where(BotConfig.id == 1))
+        if not res.scalar_one_or_none():
+            session.add(BotConfig(id=1))
+            await session.commit()
