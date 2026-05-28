@@ -63,14 +63,12 @@ async def roulette_command(message: Message, bot: Bot, session: AsyncSession):
                 f"Длительность записи: {roulette.duration_minutes} мин\n"
                 f"Триггер: {', '.join(roulette.trigger_list)}")
         await message.answer(info)
-        # Добавляем в БД сразу, чтобы иметь id
         session.add(roulette)
         await session.commit()
         # Планируем отложенный запуск
         from services.scheduler import scheduler
         from apscheduler.triggers.date import DateTrigger
         async def delayed_start():
-            # При запуске передаём правильную сессию
             from database.engine import async_session as a_s
             async with a_s() as s:
                 r = await s.get(Roulette, roulette.id)
