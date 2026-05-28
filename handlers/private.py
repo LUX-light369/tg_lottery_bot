@@ -13,6 +13,20 @@ import json
 
 router = Router()
 
+# ========== НОВЫЙ ОБРАБОТЧИК /start ==========
+@router.message(Command("start"))
+async def cmd_start(message: Message):
+    await message.answer(
+        "👋 Привет! Я бот для проведения розыгрышей и рулеток.\n\n"
+        "📌 <b>Основные команды:</b>\n"
+        "/settings — настройка модулей (рулетка / розыгрыш)\n"
+        "🎁 Создать розыгрыш — через меню /settings\n"
+        "🎰 Запуск рулетки — в чате: @рулетка 3п или @рулетка 2п 20:00\n"
+        "🔄 Перекрут рулетки — в чате: @перекрут 1п,3п\n\n"
+        "⚠️ <i>Доступ к настройкам только у главного администратора.</i>"
+    )
+# =============================================
+
 class GiveawayForm(StatesGroup):
     choose_chat = State()
     post = State()
@@ -42,6 +56,7 @@ async def main_menu(message: Message, bot: Bot):
         [InlineKeyboardButton(text="📋 Список ограничений", callback_data="list_restrictions")],
     ])
     await message.answer("⚙️ Главное меню", reply_markup=keyboard)
+
 
 @router.callback_query(F.data == "create_giveaway")
 async def cb_create_giveaway(call: CallbackQuery, state: FSMContext, bot: Bot):
