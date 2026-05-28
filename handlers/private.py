@@ -2,7 +2,7 @@ from aiogram import Router, F, Bot
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from sqlalchemy import select
 from database.models import Giveaway, ChatSettings, Restriction
 from services.checks import is_main_admin, get_chat_settings
@@ -184,7 +184,7 @@ async def confirm_giveaway(message: Message, state: FSMContext, bot: Bot):
     await message.answer("Розыгрыш запущен!")
     await state.clear()
 
-@router.message(Command("cancel"), state="*")
+@router.message(Command("cancel"), StateFilter("*"))
 async def cancel_fsm(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Отменено.")
