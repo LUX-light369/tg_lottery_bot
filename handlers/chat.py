@@ -1,6 +1,7 @@
 from aiogram import Router, F, Bot
 from aiogram.types import Message
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from database.models import Roulette
 from services.checks import is_admin, has_username, get_chat_settings
 from services.roulette import start_recording, finish_roulette
@@ -13,7 +14,7 @@ router = Router()
 
 # @рулетка [Nп] [время]
 @router.message(F.text.regexp(r"^@рулетка(?:\s+(\d+п?))?(?:\s+(\d{2}:\d{2}))?"))
-async def roulette_command(message: Message, bot: Bot):
+async def roulette_command(message: Message, bot: Bot, session: AsyncSession):
     await rate_limiter.wait(message.chat.id)
     if not await is_admin(bot, message.chat.id, message.from_user.id):
         await message.reply("Только администратор может запускать рулетку.")
@@ -23,8 +24,7 @@ async def roulette_command(message: Message, bot: Bot):
     time_str = match.group(2)    # "20:00"
     winner_count = int(winner_str.replace("п", "")) if winner_str else None
 
-    async with await bot.session() as session:
-        settings = await get_chat_settings(session, message.chat.id, 'roulette')
+    settings = await get_chat_settings(session, message.chat.id, 'roulette')
     if not settings:
         await message.reply("Сначала настройте рулетку через /settings в личке у главного админа.")
         return
@@ -63,59 +63,62 @@ async def roulette_command(message: Message, bot: Bot):
                 f"Длительность записи: {roulette.duration_minutes} мин\n"
                 f"Триггер: {', '.join(roulette.trigger_list)}")
         await message.answer(info)
-        # Запланировать запуск записи в указанное время
+        # Добавляем в БД сразу, чтобы иметь id
+        session.add(roulette)
+        await session.commit()
+        # Планируем отложенный запуск
         from services.scheduler import scheduler
         from apscheduler.triggers.date import DateTrigger
         async def delayed_start():
-            await start_recording(roulette, bot)
+            # При запуске передаём правильную сессию
+            from database.engine import async_session as a_s
+            async with a_s() as s:
+                r = await s.get(Roulette, roulette.id)
+                await start_recording(r, bot)
         scheduler.add_job(delayed_start, trigger=DateTrigger(run_date=start_time), id=f"roulette_start_{roulette.id}")
     else:
-        # Запуск сразу
         roulette.status = 'active'
-        async with await bot.session() as session:
-            session.add(roulette)
-            await session.commit()
+        session.add(roulette)
+        await session.commit()
         await start_recording(roulette, bot)
 
 # Триггеры во время активной рулетки
 @router.message(F.text)
-async def handle_triggers(message: Message, bot: Bot):
-    async with await bot.session() as session:
-        stmt = select(Roulette).where(
-            Roulette.chat_id == message.chat.id,
-            Roulette.status == 'active'
-        )
-        result = await session.execute(stmt)
-        roulette = result.scalars().first()
-        if not roulette:
-            return
-        if message.text in roulette.trigger_list:
-            # Проверка на повтор
-            if message.from_user.id in [p['user_id'] for p in roulette.participants]:
-                await message.delete()
-                try:
-                    await bot.restrict_chat_member(message.chat.id, message.from_user.id, can_send_messages=False)
-                except:
-                    pass
-                roulette.muted_users.append(message.from_user.id)
-                roulette.participants = [p for p in roulette.participants if p['user_id'] != message.from_user.id]
-                await session.commit()
-                return
-            if not await has_username(message.from_user):
-                await message.reply("У вас отсутствует @username. Установите его в настройках Telegram для участия.", quote=True)
-                await message.delete()
-                return
-            # Добавляем участника
-            roulette.participants.append({"user_id": message.from_user.id, "username": message.from_user.username})
+async def handle_triggers(message: Message, bot: Bot, session: AsyncSession):
+    stmt = select(Roulette).where(
+        Roulette.chat_id == message.chat.id,
+        Roulette.status == 'active'
+    )
+    result = await session.execute(stmt)
+    roulette = result.scalars().first()
+    if not roulette:
+        return
+    if message.text in roulette.trigger_list:
+        # Проверка на повтор
+        if message.from_user.id in [p['user_id'] for p in roulette.participants]:
+            await message.delete()
+            try:
+                await bot.restrict_chat_member(message.chat.id, message.from_user.id, can_send_messages=False)
+            except:
+                pass
+            roulette.muted_users.append(message.from_user.id)
+            roulette.participants = [p for p in roulette.participants if p['user_id'] != message.from_user.id]
             await session.commit()
+            return
+        if not await has_username(message.from_user):
+            await message.reply("У вас отсутствует @username. Установите его в настройках Telegram для участия.", quote=True)
             await message.delete()
-        else:
-            # Любое другое сообщение удаляется
-            await message.delete()
+            return
+        # Добавляем участника
+        roulette.participants.append({"user_id": message.from_user.id, "username": message.from_user.username})
+        await session.commit()
+        await message.delete()
+    else:
+        await message.delete()
 
 # Перекрут рулетки
 @router.message(F.text.regexp(r"^@перекрут(?:\s+(\d+п?(?:,\d+п?)*))"))
-async def reroll_roulette(message: Message, bot: Bot):
+async def reroll_roulette(message: Message, bot: Bot, session: AsyncSession):
     await rate_limiter.wait(message.chat.id)
     if not await is_admin(bot, message.chat.id, message.from_user.id):
         await message.reply("Только администратор может выполнить перекрут.")
@@ -126,37 +129,31 @@ async def reroll_roulette(message: Message, bot: Bot):
         return
     winners_str = match.group(1)
     exclude_ids = [int(s.replace("п","")) for s in winners_str.split(",")]
-    async with await bot.session() as session:
-        # Ищем последнюю завершённую рулетку
-        stmt = select(Roulette).where(Roulette.chat_id == message.chat.id, Roulette.status == 'finished').order_by(Roulette.created_at.desc()).limit(1)
-        res = await session.execute(stmt)
-        roulette = res.scalars().first()
-        if not roulette:
-            await message.reply("Нет завершённой рулетки для перекрута.")
-            return
-        # Получаем список участников
-        valid = []
-        for p in roulette.participants:
-            try:
-                user = await bot.get_chat(p['user_id'])
-                if user.username:
-                    valid.append(p)
-            except:
-                pass
-        if not valid:
-            await message.reply("Нет участников.")
-            return
-        # Определяем новых победителей с исключением старых индексов
-        old_winner_indices = set(roulette.winners)
-        # Исключаем также указанные номера (если они есть в old_winner_indices)
-        exclude_indices = [i-1 for i in exclude_ids if 1 <= i <= len(valid)]  # переводим в 0-based
-        new_winners = deterministic_winners(roulette.seed, len(valid), roulette.winner_count, exclude=list(old_winner_indices) + exclude_indices)
-        # Обновляем победителей в рулетке
-        roulette.winners = new_winners
-        await session.commit()
-        # Генерируем картинку
-        from services.image_gen import generate_roulette_image
-        img = generate_roulette_image(new_winners, len(valid), roulette.prizes)
-        winners_names = [valid[i]['username'] for i in new_winners]
-        caption = f"🔄 Перекрут. Новые победители: {', '.join(f'@{u}' for u in winners_names)}"
-        await bot.send_photo(message.chat.id, photo=img, caption=caption)
+    # Ищем последнюю завершённую рулетку
+    stmt = select(Roulette).where(Roulette.chat_id == message.chat.id, Roulette.status == 'finished').order_by(Roulette.created_at.desc()).limit(1)
+    res = await session.execute(stmt)
+    roulette = res.scalars().first()
+    if not roulette:
+        await message.reply("Нет завершённой рулетки для перекрута.")
+        return
+    valid = []
+    for p in roulette.participants:
+        try:
+            user = await bot.get_chat(p['user_id'])
+            if user.username:
+                valid.append(p)
+        except:
+            pass
+    if not valid:
+        await message.reply("Нет участников.")
+        return
+    old_winner_indices = set(roulette.winners)
+    exclude_indices = [i-1 for i in exclude_ids if 1 <= i <= len(valid)]
+    new_winners = deterministic_winners(roulette.seed, len(valid), roulette.winner_count, exclude=list(old_winner_indices) + exclude_indices)
+    roulette.winners = new_winners
+    await session.commit()
+    from services.image_gen import generate_roulette_image
+    img = generate_roulette_image(new_winners, len(valid), roulette.prizes)
+    winners_names = [valid[i]['username'] for i in new_winners]
+    caption = f"🔄 Перекрут. Новые победители: {', '.join(f'@{u}' for u in winners_names)}"
+    await bot.send_photo(message.chat.id, photo=img, caption=caption)
