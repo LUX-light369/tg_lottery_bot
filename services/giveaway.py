@@ -1,30 +1,28 @@
-from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from database.models import Giveaway
 from services.checks import add_restriction, get_chat_settings
-from services.image_gen import generate_roulette_image  # можно отдельную функцию
+from services.image_gen import generate_roulette_image
 from utils.helpers import deterministic_winners
 from datetime import datetime
 
-async def start_giveaway(giveaway, bot):
-    # Отправка поста в чат
+async def start_giveaway(giveaway: Giveaway, bot):
     text = giveaway.post_text or "🎉 Розыгрыш!"
     if giveaway.post_media:
         msg = await bot.send_photo(giveaway.chat_id, photo=giveaway.post_media, caption=text)
     else:
         msg = await bot.send_message(giveaway.chat_id, text)
     giveaway.post_message_id = msg.message_id
-    async with await bot.session() as session:
-        session.add(giveaway)
-        await session.commit()
+    # Сессия уже сохранена в БД вызывающей стороной
 
-async def check_giveaway_completion(giveaway, bot):
-    async with await bot.session() as session:
+async def check_giveaway_completion(giveaway: Giveaway, bot):
+    from database.engine import async_session
+    async with async_session() as session:
         if giveaway.mode == 'time' and datetime.utcnow() >= giveaway.end_time:
             await finish_giveaway(giveaway, bot, session)
         elif giveaway.mode == 'participants' and len(giveaway.participants) >= giveaway.max_participants:
             await finish_giveaway(giveaway, bot, session)
 
-async def finish_giveaway(giveaway, bot, session):
+async def finish_giveaway(giveaway: Giveaway, bot, session: AsyncSession):
     total = len(giveaway.participants)
     if total == 0:
         return
@@ -36,7 +34,6 @@ async def finish_giveaway(giveaway, bot, session):
     winners_names = [giveaway.participants[i]['username'] for i in winners_idx]
     caption = f"Победители: {', '.join(f'@{u}' for u in winners_names)}"
     await bot.send_photo(giveaway.chat_id, photo=img, caption=caption)
-    # Ограничения
     settings = await get_chat_settings(session, giveaway.chat_id, 'giveaway')
     ban_days = settings.get('ban_days', 7)
     for i in winners_idx:
