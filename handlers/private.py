@@ -4,6 +4,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command, StateFilter
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from database.models import Giveaway, ChatSettings, Restriction
 from services.checks import is_main_admin, get_chat_settings
 from services.giveaway import start_giveaway
@@ -158,7 +159,7 @@ async def process_prizes(message: Message, state: FSMContext, bot: Bot):
     await state.set_state(GiveawayForm.confirm)
 
 @router.message(GiveawayForm.confirm, Command("confirm"))
-async def confirm_giveaway(message: Message, state: FSMContext, bot: Bot):
+async def confirm_giveaway(message: Message, state: FSMContext, bot: Bot, session: AsyncSession):
     data = await state.get_data()
     seed = generate_seed()
     giveaway = Giveaway(
@@ -177,9 +178,8 @@ async def confirm_giveaway(message: Message, state: FSMContext, bot: Bot):
         post_media=data['post_media'],
         status='active'
     )
-    async with await bot.session() as session:
-        session.add(giveaway)
-        await session.commit()
+    session.add(giveaway)
+    await session.commit()
     await start_giveaway(giveaway, bot)
     await message.answer("Розыгрыш запущен!")
     await state.clear()
@@ -200,7 +200,7 @@ async def start_settings(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 @router.message(SettingsFSM.waiting_chat_id)
-async def process_chat_id(message: Message, state: FSMContext, bot: Bot):
+async def process_chat_id(message: Message, state: FSMContext, bot: Bot, session: AsyncSession):
     try:
         chat_id = int(message.text)
     except:
@@ -216,8 +216,7 @@ async def process_chat_id(message: Message, state: FSMContext, bot: Bot):
     await state.update_data(chat_id=chat_id)
     data = await state.get_data()
     module = data['module']
-    async with await bot.session() as session:
-        settings = await get_chat_settings(session, chat_id, module)
+    settings = await get_chat_settings(session, chat_id, module)
     text = f"Текущие настройки {module} для чата {chat_id}:\n" + json.dumps(settings, ensure_ascii=False, indent=2)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Изменить время записи (рулетка)", callback_data="edit_duration")],
@@ -240,7 +239,7 @@ async def edit_setting(call: CallbackQuery, state: FSMContext, bot: Bot):
     await call.answer()
 
 @router.message(SettingsFSM.waiting_value)
-async def process_new_value(message: Message, state: FSMContext, bot: Bot):
+async def process_new_value(message: Message, state: FSMContext, bot: Bot, session: AsyncSession):
     data = await state.get_data()
     param = data['editing_param']
     chat_id = data['chat_id']
@@ -252,21 +251,19 @@ async def process_new_value(message: Message, state: FSMContext, bot: Bot):
         new_value = int(new_value)
     elif param in ("prizes", "triggers"):
         new_value = [x.strip() for x in new_value.split(",") if x.strip()]
-    async with await bot.session() as session:
-        stmt = select(ChatSettings).where(ChatSettings.chat_id == chat_id, ChatSettings.module == module)
-        res = await session.execute(stmt)
-        settings = res.scalars().first()
-        if not settings:
-            settings = ChatSettings(chat_id=chat_id, module=module, data={})
-            session.add(settings)
-        settings.data[param] = new_value
-        await session.commit()
+    stmt = select(ChatSettings).where(ChatSettings.chat_id == chat_id, ChatSettings.module == module)
+    res = await session.execute(stmt)
+    settings = res.scalars().first()
+    if not settings:
+        settings = ChatSettings(chat_id=chat_id, module=module, data={})
+        session.add(settings)
+    settings.data[param] = new_value
+    await session.commit()
     await message.answer(f"Значение {param} обновлено.")
-    await show_settings_menu(message, chat_id, module, bot, state)
+    await show_settings_menu(message, chat_id, module, bot, state, session)
 
-async def show_settings_menu(message, chat_id, module, bot, state):
-    async with await bot.session() as session:
-        settings = await get_chat_settings(session, chat_id, module)
+async def show_settings_menu(message, chat_id, module, bot, state, session: AsyncSession):
+    settings = await get_chat_settings(session, chat_id, module)
     text = f"Текущие настройки {module} для чата {chat_id}:\n" + json.dumps(settings, ensure_ascii=False, indent=2)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Изменить время записи (рулетка)", callback_data="edit_duration")],
