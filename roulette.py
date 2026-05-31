@@ -103,7 +103,6 @@ async def send_template(bot: Bot, chat_id: int, template_str: str, **substitutio
                     message_id=data['message_id']
                 )
             elif data.get('type') == 'media':
-                # Прямая отправка медиа по file_id
                 media_type = data['media_type']
                 file_id = data['file_id']
                 caption = substitute(data.get('caption', ''), **substitutions)
@@ -119,7 +118,6 @@ async def send_template(bot: Bot, chat_id: int, template_str: str, **substitutio
                     return await bot.send_message(chat_id, caption)
     except:
         pass
-    # Обычный текст
     text = substitute(template_str, **substitutions)
     return await bot.send_message(chat_id, text)
 
@@ -128,7 +126,6 @@ def save_media_template(message: types.Message) -> str:
     if message.forward_from_chat and message.forward_from_message_id:
         return json.dumps({'type': 'forward', 'chat_id': message.forward_from_chat.id,
                            'message_id': message.forward_from_message_id})
-    # Прямые медиа
     if message.photo:
         file_id = message.photo[-1].file_id
         return json.dumps({'type': 'media', 'media_type': 'photo', 'file_id': file_id,
@@ -142,7 +139,6 @@ def save_media_template(message: types.Message) -> str:
     if message.document:
         return json.dumps({'type': 'media', 'media_type': 'document', 'file_id': message.document.file_id,
                            'caption': message.caption or ''})
-    # Текст
     return message.text or message.caption or ''
 
 # ---------- Сессия записи ----------
@@ -151,13 +147,12 @@ class RouletteSession:
         self.chat_id = chat_id
         self.roulette_id = roulette_id
         self.trigger = trigger.lower().strip()
-        self.participants: Dict[int, dict] = {}  # user_id -> данные
-        self.valid_order: List[int] = []          # user_id в порядке записи
+        self.participants: Dict[int, dict] = {}
+        self.valid_order: List[int] = []
 
     def process_message(self, user_id: int, username: Optional[str], message_id: int, text: str) -> Tuple[str, Optional[int]]:
         """
         Возвращает (action, trigger_msg_id_to_delete).
-        action: 'valid', 'no_username', 'disqualified', 'extra_ignored', 'ignored', 'banned'
         """
         if is_user_banned(user_id, username):
             return 'banned', None
@@ -165,7 +160,6 @@ class RouletteSession:
         cleaned = text.strip().lower()
         is_trigger = (cleaned == self.trigger)
 
-        # Получаем или создаём запись
         rec = self.participants.get(user_id)
         if not rec:
             rec = {
@@ -183,10 +177,8 @@ class RouletteSession:
 
         if is_trigger:
             if rec['has_trigger']:
-                # Повторный триггер
                 rec['disqualified'] = True
                 return 'disqualified', rec.get('trigger_msg_id')
-            # Первый триггер
             rec['has_trigger'] = True
             rec['trigger_msg_id'] = message_id
             if username:
@@ -197,7 +189,6 @@ class RouletteSession:
             else:
                 return 'no_username', None
         else:
-            # Не триггер
             rec['non_trigger_count'] += 1
             if rec['non_trigger_count'] >= 2:
                 rec['disqualified'] = True
@@ -236,7 +227,6 @@ async def start_cmd(message: types.Message, bot: Bot):
         return
     if message.from_user.id == MAIN_ADMIN_ID:
         await menu(message)
-    # обычным пользователям ничего не показываем
 
 # ---------- @рулетка ----------
 @admin_router.message(F.text.regexp(r'@рулетка\s+(.+)'))
@@ -355,24 +345,20 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     roulette = get_roulette_by_id(rid)
     if not roulette or roulette['status'] != 'waiting_start':
         return
-    # Правила
     rules = roulette['rules']
     if rules:
         await send_template(bot, chat_id, rules, trigger=roulette['trigger'], duration=str(roulette['duration']))
-    # Старт
     start = roulette['start_msg']
     if start:
         await send_template(bot, chat_id, start, trigger=roulette['trigger'])
     session = RouletteSession(chat_id, rid, roulette['trigger'])
     active_sessions[chat_id] = session
     update_roulette(rid, status='recording')
-    # Преобразуем stop_time из строки в datetime
     stop_time_str = roulette['stop_time']
     stop_time = parse_datetime(stop_time_str) if isinstance(stop_time_str, str) else stop_time_str
     delay = (stop_time - datetime.now(NOVOSIBIRSK)).total_seconds()
     if delay > 0:
         await asyncio.sleep(delay)
-    # Стоп
     stop = roulette['stop_msg']
     if stop:
         await send_template(bot, chat_id, stop)
@@ -438,7 +424,6 @@ async def filter_msg(message: types.Message, bot: Bot):
     elif action == 'no_username':
         await message.reply("⚠️ Нужен @username. Установите до конца записи.")
     elif action == 'disqualified':
-        # Удаляем текущее сообщение и триггер, если был
         await message.delete()
         if trigger_to_delete:
             try:
@@ -514,9 +499,6 @@ async def view_settings(call: types.CallbackQuery):
 @admin_router.callback_query(F.data == "back_to_menu")
 async def back_menu(call: types.CallbackQuery):
     await menu(call.message)
-
-# Все обработчики состояний (set_chat, set_duration, ...) – без изменений,
-# только при показе сообщений добавляем reply_markup=back_btn().
 
 @admin_router.callback_query(F.data == "set_chat")
 async def set_chat_start(call: types.CallbackQuery, state: FSMContext):
