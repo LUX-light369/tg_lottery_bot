@@ -2,6 +2,9 @@ import sqlite3
 import json
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
+import pytz
+
+NOVOSIBIRSK = pytz.timezone('Asia/Novosibirsk')
 
 DB_NAME = "roulette_bot.db"
 
@@ -61,6 +64,18 @@ def init_db():
         }
         for k, v in defaults.items():
             conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
+
+def parse_datetime(date_str: str) -> datetime:
+    """Преобразует строку в aware datetime с таймзоной Новосибирска."""
+    try:
+        dt = datetime.fromisoformat(date_str)
+        if dt.tzinfo is None:
+            dt = NOVOSIBIRSK.localize(dt)
+        return dt
+    except:
+        return datetime.now(NOVOSIBIRSK)
+
+# Остальные функции без изменений...
 
 # --- Settings ---
 def get_setting(key: str) -> str:
