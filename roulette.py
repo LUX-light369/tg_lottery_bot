@@ -26,7 +26,6 @@ NOVOSIBIRSK = pytz.timezone('Asia/Novosibirsk')
 message_queue = asyncio.Queue()
 logger = logging.getLogger(__name__)
 
-MAIN_ADMIN_ID = None
 # ---------- Очередь сообщений ----------
 async def queue_worker(bot: Bot):
     while True:
@@ -683,6 +682,7 @@ async def set_max_finish(message: types.Message, state: FSMContext):
         await message.answer("Введите число.", reply_markup=back_btn())
     await state.clear()
 
+MAIN_ADMIN_ID = None
 # ---------- Функция setup_routers ----------
 def setup_routers(dp: Dispatcher, bot: Bot, main_admin_id: int):
     dp.include_router(router)
