@@ -20,12 +20,13 @@ from database import (
     get_last_finished_roulette, delete_old_roulettes, get_conn, init_db
 )
 from random_utils import generate_seed_hash, select_winners, create_result_image, get_verification_instruction
-from config import MAIN_ADMIN_ID
+
 
 NOVOSIBIRSK = pytz.timezone('Asia/Novosibirsk')
 message_queue = asyncio.Queue()
 logger = logging.getLogger(__name__)
 
+MAIN_ADMIN_ID = None
 # ---------- Очередь сообщений ----------
 async def queue_worker(bot: Bot):
     while True:
