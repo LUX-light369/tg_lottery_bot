@@ -17,7 +17,8 @@ from database import (
     get_setting, set_setting, get_channels, add_channel, remove_channel,
     add_banned_user, is_user_banned, clean_expired_bans,
     save_roulette, update_roulette, get_roulette, get_roulette_by_id,
-    get_last_finished_roulette, delete_old_roulettes, get_conn, init_db
+    get_last_finished_roulette, delete_old_roulettes, get_conn, init_db,
+    parse_datetime
 )
 from random_utils import generate_seed_hash, select_winners, create_result_image, get_verification_instruction
 
@@ -25,7 +26,7 @@ NOVOSIBIRSK = pytz.timezone('Asia/Novosibirsk')
 message_queue = asyncio.Queue()
 logger = logging.getLogger(__name__)
 
-MAIN_ADMIN_ID = None  # будет установлен в setup_routers
+MAIN_ADMIN_ID = None
 
 # ---------- Очередь сообщений ----------
 async def queue_worker(bot: Bot):
@@ -91,25 +92,58 @@ def substitute(template: str, **kwargs) -> str:
     return template
 
 async def send_template(bot: Bot, chat_id: int, template_str: str, **substitutions) -> types.Message:
-    """
-    Отправляет шаблон в чат. template_str может быть обычным текстом или JSON с инструкцией пересылки.
-    Подставляет переменные.
-    """
-    # Пытаемся интерпретировать как JSON (если админ сохранил пересланное сообщение)
+    """Отправляет шаблон: текст или пересланное сообщение, либо медиа по file_id."""
     try:
         data = json.loads(template_str)
-        if isinstance(data, dict) and data.get('type') == 'forward':
-            # Пересылаем исходное сообщение без изменений
-            return await bot.copy_message(
-                chat_id=chat_id,
-                from_chat_id=data['chat_id'],
-                message_id=data['message_id']
-            )
+        if isinstance(data, dict):
+            if data.get('type') == 'forward':
+                return await bot.copy_message(
+                    chat_id=chat_id,
+                    from_chat_id=data['chat_id'],
+                    message_id=data['message_id']
+                )
+            elif data.get('type') == 'media':
+                # Прямая отправка медиа по file_id
+                media_type = data['media_type']
+                file_id = data['file_id']
+                caption = substitute(data.get('caption', ''), **substitutions)
+                if media_type == 'photo':
+                    return await bot.send_photo(chat_id, photo=file_id, caption=caption)
+                elif media_type == 'video':
+                    return await bot.send_video(chat_id, video=file_id, caption=caption)
+                elif media_type == 'animation':
+                    return await bot.send_animation(chat_id, animation=file_id, caption=caption)
+                elif media_type == 'document':
+                    return await bot.send_document(chat_id, document=file_id, caption=caption)
+                else:
+                    return await bot.send_message(chat_id, caption)
     except:
         pass
     # Обычный текст
     text = substitute(template_str, **substitutions)
     return await bot.send_message(chat_id, text)
+
+def save_media_template(message: types.Message) -> str:
+    """Сохраняет сообщение как шаблон: пересланное или медиа."""
+    if message.forward_from_chat and message.forward_from_message_id:
+        return json.dumps({'type': 'forward', 'chat_id': message.forward_from_chat.id,
+                           'message_id': message.forward_from_message_id})
+    # Прямые медиа
+    if message.photo:
+        file_id = message.photo[-1].file_id
+        return json.dumps({'type': 'media', 'media_type': 'photo', 'file_id': file_id,
+                           'caption': message.caption or ''})
+    if message.video:
+        return json.dumps({'type': 'media', 'media_type': 'video', 'file_id': message.video.file_id,
+                           'caption': message.caption or ''})
+    if message.animation:
+        return json.dumps({'type': 'media', 'media_type': 'animation', 'file_id': message.animation.file_id,
+                           'caption': message.caption or ''})
+    if message.document:
+        return json.dumps({'type': 'media', 'media_type': 'document', 'file_id': message.document.file_id,
+                           'caption': message.caption or ''})
+    # Текст
+    return message.text or message.caption or ''
 
 # ---------- Сессия записи ----------
 class RouletteSession:
@@ -117,44 +151,65 @@ class RouletteSession:
         self.chat_id = chat_id
         self.roulette_id = roulette_id
         self.trigger = trigger.lower().strip()
-        self.participants: Dict[int, dict] = {}
-        self.valid_order: List[int] = []
+        self.participants: Dict[int, dict] = {}  # user_id -> данные
+        self.valid_order: List[int] = []          # user_id в порядке записи
 
-    def process_message(self, user_id: int, username: Optional[str], message_id: int, text: str) -> str:
+    def process_message(self, user_id: int, username: Optional[str], message_id: int, text: str) -> Tuple[str, Optional[int]]:
+        """
+        Возвращает (action, trigger_msg_id_to_delete).
+        action: 'valid', 'no_username', 'disqualified', 'extra_ignored', 'ignored', 'banned'
+        """
         if is_user_banned(user_id, username):
-            return 'banned'
+            return 'banned', None
+
         cleaned = text.strip().lower()
         is_trigger = (cleaned == self.trigger)
-        if user_id in self.participants:
-            rec = self.participants[user_id]
-            if rec['disqualified']:
-                return 'disqualified'
-            if is_trigger:
-                rec['disqualified'] = True
-                return 'disqualified'
-            rec['msg_count'] += 1
-            if rec['msg_count'] == 1:
-                return 'extra_ignored'
-            rec['disqualified'] = True
-            return 'disqualified'
-        else:
-            if not is_trigger:
-                return 'ignored'
-            rec = {'username': username, 'message_id': message_id, 'valid': False,
-                   'disqualified': False, 'msg_count': 0, 'warned': False}
-            if not username:
-                self.participants[user_id] = rec
-                return 'no_username'
-            rec['valid'] = True
+
+        # Получаем или создаём запись
+        rec = self.participants.get(user_id)
+        if not rec:
+            rec = {
+                'username': username,
+                'valid': False,
+                'disqualified': False,
+                'non_trigger_count': 0,
+                'has_trigger': False,
+                'trigger_msg_id': None
+            }
             self.participants[user_id] = rec
-            self.valid_order.append(user_id)
-            return 'valid'
+
+        if rec['disqualified']:
+            return 'disqualified', rec.get('trigger_msg_id')
+
+        if is_trigger:
+            if rec['has_trigger']:
+                # Повторный триггер
+                rec['disqualified'] = True
+                return 'disqualified', rec.get('trigger_msg_id')
+            # Первый триггер
+            rec['has_trigger'] = True
+            rec['trigger_msg_id'] = message_id
+            if username:
+                rec['valid'] = True
+                rec['username'] = username
+                self.valid_order.append(user_id)
+                return 'valid', None
+            else:
+                return 'no_username', None
+        else:
+            # Не триггер
+            rec['non_trigger_count'] += 1
+            if rec['non_trigger_count'] >= 2:
+                rec['disqualified'] = True
+                return 'disqualified', rec.get('trigger_msg_id')
+            else:
+                return 'extra_ignored', None
 
     async def finalize(self, bot: Bot) -> List[int]:
         final = []
         for uid in self.valid_order:
             rec = self.participants.get(uid)
-            if not rec or rec['disqualified']:
+            if not rec or rec['disqualified'] or not rec['valid']:
                 continue
             username = rec['username']
             if not username:
@@ -171,26 +226,23 @@ class RouletteSession:
 active_sessions: Dict[int, RouletteSession] = {}
 
 # ---------- Роутеры ----------
-admin_router = Router()   # команды и меню
-filter_router = Router()  # фильтрация участников во время записи
+admin_router = Router()
+filter_router = Router()
 
-# ---------- /start в личке ----------
+# ---------- /start ----------
 @admin_router.message(Command('start'))
 async def start_cmd(message: types.Message, bot: Bot):
     if message.chat.type != 'private':
         return
-    await message.answer(
-        "🎲 Привет! Я бот для проведения честных рулеток.\n"
-        "Настройки доступны в /menu (только для главного админа).\n"
-        "В группах используйте @рулетка."
-    )
+    if message.from_user.id == MAIN_ADMIN_ID:
+        await menu(message)
+    # обычным пользователям ничего не показываем
 
 # ---------- @рулетка ----------
 @admin_router.message(F.text.regexp(r'@рулетка\s+(.+)'))
 async def roulette_cmd(message: types.Message, bot: Bot):
     logger.info(f"Получена команда @рулетка от {message.from_user.id} в чате {message.chat.id}")
     if not await is_admin(bot, message.chat.id, message.from_user.id):
-        logger.warning(f"Отказано: пользователь {message.from_user.id} не админ")
         return
     chat_id = message.chat.id
     allowed = get_setting('chat_id')
@@ -314,7 +366,10 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     session = RouletteSession(chat_id, rid, roulette['trigger'])
     active_sessions[chat_id] = session
     update_roulette(rid, status='recording')
-    delay = (roulette['stop_time'] - datetime.now(NOVOSIBIRSK)).total_seconds()
+    # Преобразуем stop_time из строки в datetime
+    stop_time_str = roulette['stop_time']
+    stop_time = parse_datetime(stop_time_str) if isinstance(stop_time_str, str) else stop_time_str
+    delay = (stop_time - datetime.now(NOVOSIBIRSK)).total_seconds()
     if delay > 0:
         await asyncio.sleep(delay)
     # Стоп
@@ -322,7 +377,7 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     if stop:
         await send_template(bot, chat_id, stop)
     valid_users = await session.finalize(bot)
-    valid_users.sort(key=lambda uid: session.participants[uid]['message_id'])
+    valid_users.sort(key=lambda uid: session.participants[uid]['trigger_msg_id'])
     names = []
     for uid in valid_users:
         try:
@@ -360,7 +415,7 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
             await unmute_user(bot, chat_id, uid)
     active_sessions.pop(chat_id, None)
 
-# ---------- Фильтр сообщений участников (только при активной сессии) ----------
+# ---------- Фильтр сообщений участников ----------
 async def has_active_session(message: types.Message) -> bool:
     return message.chat.id in active_sessions
 
@@ -376,23 +431,31 @@ async def filter_msg(message: types.Message, bot: Bot):
     user_id = message.from_user.id
     username = parse_username(message.from_user)
     text = message.text or message.caption or ""
-    action = session.process_message(user_id, username, message.message_id, text)
+    action, trigger_to_delete = session.process_message(user_id, username, message.message_id, text)
 
     if action == 'valid':
         return
     elif action == 'no_username':
         await message.reply("⚠️ Нужен @username. Установите до конца записи.")
     elif action == 'disqualified':
+        # Удаляем текущее сообщение и триггер, если был
         await message.delete()
+        if trigger_to_delete:
+            try:
+                await bot.delete_message(message.chat.id, trigger_to_delete)
+            except:
+                pass
         await mute_user(bot, message.chat.id, user_id)
         enqueue(message.chat.id, 'send_message', text=f"⛔ {message.from_user.full_name} дисквалифицирован.")
-    elif action in ['extra_ignored', 'ignored']:
+    elif action == 'extra_ignored':
+        await message.delete()
+    elif action == 'ignored':
         await message.delete()
     elif action == 'banned':
         await message.delete()
         enqueue(message.chat.id, 'send_message', text=f"🚫 {message.from_user.full_name}, вы забанены.")
 
-# ---------- Меню настроек (только для главного админа в ЛС) ----------
+# ---------- Меню настроек ----------
 class SettingsForm(StatesGroup):
     waiting_for_chat_id = State()
     waiting_for_duration = State()
@@ -452,11 +515,13 @@ async def view_settings(call: types.CallbackQuery):
 async def back_menu(call: types.CallbackQuery):
     await menu(call.message)
 
-# Обработчики настроек (каждый с FSM)
+# Все обработчики состояний (set_chat, set_duration, ...) – без изменений,
+# только при показе сообщений добавляем reply_markup=back_btn().
+
 @admin_router.callback_query(F.data == "set_chat")
 async def set_chat_start(call: types.CallbackQuery, state: FSMContext):
-    await call.message.edit_text("Введите ID чата, где будет работать рулетка. Текущий: " +
-                                 (get_setting('chat_id') or 'не задан'), reply_markup=back_btn())
+    await call.message.edit_text("Введите ID чата (текущий: " +
+                                 (get_setting('chat_id') or 'не задан') + ")", reply_markup=back_btn())
     await state.set_state(SettingsForm.waiting_for_chat_id)
     await call.answer()
 
@@ -475,7 +540,7 @@ async def set_chat_finish(message: types.Message, state: FSMContext):
 
 @admin_router.callback_query(F.data == "set_duration")
 async def set_duration_start(call: types.CallbackQuery, state: FSMContext):
-    await call.message.edit_text("Введите длительность записи в минутах (сейчас " +
+    await call.message.edit_text("Введите длительность в минутах (сейчас " +
                                  get_setting('duration') + "):", reply_markup=back_btn())
     await state.set_state(SettingsForm.waiting_for_duration)
     await call.answer()
@@ -492,8 +557,7 @@ async def set_duration_finish(message: types.Message, state: FSMContext):
 @admin_router.callback_query(F.data == "set_trigger")
 async def set_trigger_start(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text("Отправьте новый триггер (сейчас «" +
-                                 get_setting('trigger') + "»). Допускается символ, слово или эмодзи.",
-                                 reply_markup=back_btn())
+                                 get_setting('trigger') + "»):", reply_markup=back_btn())
     await state.set_state(SettingsForm.waiting_for_trigger)
     await call.answer()
 
@@ -509,8 +573,8 @@ async def set_trigger_finish(message: types.Message, state: FSMContext):
 
 @admin_router.callback_query(F.data == "set_prizes")
 async def set_prizes_start(call: types.CallbackQuery, state: FSMContext):
-    await call.message.edit_text("Введите призы в формате JSON-списка, например [\"приз1\",\"приз2\"]. Сейчас: " +
-                                 (get_setting('prizes') or '[]'), reply_markup=back_btn())
+    await call.message.edit_text("Введите призы в формате JSON-списка (сейчас " +
+                                 (get_setting('prizes') or '[]') + "):", reply_markup=back_btn())
     await state.set_state(SettingsForm.waiting_for_prizes)
     await call.answer()
 
@@ -529,21 +593,16 @@ async def set_prizes_finish(message: types.Message, state: FSMContext):
 
 @admin_router.callback_query(F.data == "set_rules")
 async def set_rules_start(call: types.CallbackQuery, state: FSMContext):
-    await call.message.edit_text("Отправьте текст правил (можно с ${trigger} и ${duration}) или перешлите готовое сообщение.",
+    await call.message.edit_text("Отправьте текст правил или перешлите готовое сообщение.",
                                  reply_markup=back_btn())
     await state.set_state(SettingsForm.waiting_for_rules)
     await call.answer()
 
 @admin_router.message(StateFilter(SettingsForm.waiting_for_rules))
 async def set_rules_finish(message: types.Message, state: FSMContext):
-    if message.forward_from_chat and message.forward_from_message_id:
-        data = json.dumps({'type': 'forward', 'chat_id': message.forward_from_chat.id,
-                           'message_id': message.forward_from_message_id})
-        set_setting('rules', data)
-        await message.answer("Шаблон правил сохранён (пересланное сообщение).", reply_markup=back_btn())
-    else:
-        set_setting('rules', message.text or message.caption or "")
-        await message.answer("Текст правил сохранён.", reply_markup=back_btn())
+    data = save_media_template(message)
+    set_setting('rules', data)
+    await message.answer("Правила сохранены.", reply_markup=back_btn())
     await state.clear()
 
 @admin_router.callback_query(F.data == "set_start_msg")
@@ -555,14 +614,9 @@ async def set_start_msg_start(call: types.CallbackQuery, state: FSMContext):
 
 @admin_router.message(StateFilter(SettingsForm.waiting_for_start_msg))
 async def set_start_msg_finish(message: types.Message, state: FSMContext):
-    if message.forward_from_chat and message.forward_from_message_id:
-        data = json.dumps({'type': 'forward', 'chat_id': message.forward_from_chat.id,
-                           'message_id': message.forward_from_message_id})
-        set_setting('start_msg', data)
-        await message.answer("Стартовое сообщение сохранено (пересланное).", reply_markup=back_btn())
-    else:
-        set_setting('start_msg', message.text or message.caption or "")
-        await message.answer("Стартовое сообщение сохранено.", reply_markup=back_btn())
+    data = save_media_template(message)
+    set_setting('start_msg', data)
+    await message.answer("Стартовое сообщение сохранено.", reply_markup=back_btn())
     await state.clear()
 
 @admin_router.callback_query(F.data == "set_stop_msg")
@@ -574,14 +628,9 @@ async def set_stop_msg_start(call: types.CallbackQuery, state: FSMContext):
 
 @admin_router.message(StateFilter(SettingsForm.waiting_for_stop_msg))
 async def set_stop_msg_finish(message: types.Message, state: FSMContext):
-    if message.forward_from_chat and message.forward_from_message_id:
-        data = json.dumps({'type': 'forward', 'chat_id': message.forward_from_chat.id,
-                           'message_id': message.forward_from_message_id})
-        set_setting('stop_msg', data)
-        await message.answer("Стоп-сообщение сохранено (пересланное).", reply_markup=back_btn())
-    else:
-        set_setting('stop_msg', message.text or message.caption or "")
-        await message.answer("Стоп-сообщение сохранено.", reply_markup=back_btn())
+    data = save_media_template(message)
+    set_setting('stop_msg', data)
+    await message.answer("Стоп-сообщение сохранено.", reply_markup=back_btn())
     await state.clear()
 
 @admin_router.callback_query(F.data == "set_result_msg")
@@ -593,14 +642,9 @@ async def set_result_msg_start(call: types.CallbackQuery, state: FSMContext):
 
 @admin_router.message(StateFilter(SettingsForm.waiting_for_result_msg))
 async def set_result_msg_finish(message: types.Message, state: FSMContext):
-    if message.forward_from_chat and message.forward_from_message_id:
-        data = json.dumps({'type': 'forward', 'chat_id': message.forward_from_chat.id,
-                           'message_id': message.forward_from_message_id})
-        set_setting('result_msg', data)
-        await message.answer("Пост победителей сохранён (пересланный).", reply_markup=back_btn())
-    else:
-        set_setting('result_msg', message.text or message.caption or "")
-        await message.answer("Пост победителей сохранён.", reply_markup=back_btn())
+    data = save_media_template(message)
+    set_setting('result_msg', data)
+    await message.answer("Пост победителей сохранён.", reply_markup=back_btn())
     await state.clear()
 
 @admin_router.callback_query(F.data == "channels_menu")
@@ -615,7 +659,7 @@ async def channels_menu(call: types.CallbackQuery):
 
 @admin_router.callback_query(F.data == "channel_add")
 async def channel_add_start(call: types.CallbackQuery, state: FSMContext):
-    await call.message.edit_text("Перешлите любое сообщение из канала или введите его username (@channel).",
+    await call.message.edit_text("Перешлите сообщение из канала или введите @username.",
                                  reply_markup=back_btn())
     await state.set_state(SettingsForm.waiting_for_channel_add)
     await call.answer()
@@ -634,12 +678,12 @@ async def channel_add_finish(message: types.Message, state: FSMContext):
         except:
             await message.answer("Не удалось найти канал.", reply_markup=back_btn())
     else:
-        await message.answer("Неверный формат. Перешлите сообщение или введите @username.", reply_markup=back_btn())
+        await message.answer("Неверный формат.", reply_markup=back_btn())
     await state.clear()
 
 @admin_router.callback_query(F.data == "channel_del")
 async def channel_del_start(call: types.CallbackQuery, state: FSMContext):
-    await call.message.edit_text("Введите ID канала для удаления (или username).",
+    await call.message.edit_text("Введите ID канала или @username для удаления.",
                                  reply_markup=back_btn())
     await state.set_state(SettingsForm.waiting_for_channel_del)
     await call.answer()
@@ -662,7 +706,7 @@ async def ban_menu(call: types.CallbackQuery):
 
 @admin_router.callback_query(F.data == "ban_add")
 async def ban_add_start(call: types.CallbackQuery, state: FSMContext):
-    await call.message.edit_text("Введите через пробел: @username или user_id, дни, причина (опционально). Пример: @user 30 спам",
+    await call.message.edit_text("Введите @username или user_id, дни, причина (опционально). Пример: @user 30 спам",
                                  reply_markup=back_btn())
     await state.set_state(SettingsForm.waiting_for_ban)
     await call.answer()
