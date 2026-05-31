@@ -75,9 +75,6 @@ def parse_datetime(date_str: str) -> datetime:
     except:
         return datetime.now(NOVOSIBIRSK)
 
-# Остальные функции без изменений...
-
-# --- Settings ---
 def get_setting(key: str) -> str:
     with get_conn() as conn:
         row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -87,7 +84,6 @@ def set_setting(key: str, value: str):
     with get_conn() as conn:
         conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
 
-# --- Channels ---
 def get_channels() -> List[str]:
     with get_conn() as conn:
         rows = conn.execute("SELECT channel_id FROM channels").fetchall()
@@ -101,7 +97,6 @@ def remove_channel(channel_id: str):
     with get_conn() as conn:
         conn.execute("DELETE FROM channels WHERE channel_id=?", (channel_id,))
 
-# --- Bans ---
 def add_banned_user(user_id: Optional[int], username: Optional[str], days: int, reason: str = ""):
     banned_until = datetime.now() + timedelta(days=days)
     with get_conn() as conn:
@@ -123,15 +118,15 @@ def clean_expired_bans():
     with get_conn() as conn:
         conn.execute("DELETE FROM banned_users WHERE banned_until <= ?", (datetime.now(),))
 
-# --- Roulettes ---
 def save_roulette(chat_id: int, status: str, duration: int, winners_count: int,
                   trigger: str, prizes: str, rules: str, start_msg: str, stop_msg: str,
-                  result_msg: str, start_time: datetime, stop_time: datetime) -> int:
+                  result_msg: str, start_time: datetime, stop_time: datetime,
+                  seed: str = None, seed_hash: str = None) -> int:
     with get_conn() as conn:
-        cur = conn.execute("""INSERT INTO roulettes (chat_id, status, duration, winners_count, trigger, prizes, rules, start_msg, stop_msg, result_msg, start_time, stop_time)
-                      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        cur = conn.execute("""INSERT INTO roulettes (chat_id, status, duration, winners_count, trigger, prizes, rules, start_msg, stop_msg, result_msg, start_time, stop_time, seed, seed_hash)
+                      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                       (chat_id, status, duration, winners_count, trigger, prizes, rules, start_msg, stop_msg, result_msg,
-                       start_time, stop_time))
+                       start_time, stop_time, seed, seed_hash))
         return cur.lastrowid
 
 def update_roulette(roulette_id: int, **kwargs):
