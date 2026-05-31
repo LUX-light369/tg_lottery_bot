@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Проверка честности рулетки</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.0.0/crypto-js.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/seedrandom/3.0.5/seedrandom.min.js"></script>
+</head>
+<body>
+    <h1>Проверка честности рулетки</h1>
+    <p>Введите seed, список участников (каждый с новой строки, в порядке записи) и количество победителей.</p>
+    <label>Seed: <input type="text" id="seed"></label><br><br>
+    <label>Участники:<br><textarea id="participants" rows="10" cols="30"></textarea></label><br>
+    <label>Количество победителей: <input type="number" id="count" min="1"></label><br><br>
+    <button onclick="verify()">Проверить</button>
+    <div id="result"></div>
+
+    <script>
+        function verify() {
+            const seed = document.getElementById('seed').value;
+            const participants = document.getElementById('participants').value.split('\n').filter(p => p.trim() !== '');
+            const count = parseInt(document.getElementById('count').value);
+            
+            // Хеш
+            const hash = CryptoJS.SHA256(seed).toString();
+            
+            // Воспроизводим random.Random(seed).shuffle
+            let rng = new Math.seedrandom(seed);
+            let indices = Array.from(Array(participants.length).keys());
+            // Фишер-Йетс
+            for (let i = indices.length - 1; i > 0; i--) {
+                const j = Math.floor(rng() * (i + 1));
+                [indices[i], indices[j]] = [indices[j], indices[i]];
+            }
+            const winners = indices.slice(0, count).map(i => participants[i]);
+            
+            document.getElementById('result').innerHTML = `
+                <p>Хеш: ${hash}</p>
+                <p>Победители (по алгоритму): ${winners.join(', ') || 'нет'}</p>
+                <p>Сравните с объявленными в чате.</p>
+            `;
+        }
+    </script>
+</body>
+</html>
