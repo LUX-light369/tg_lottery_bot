@@ -201,14 +201,13 @@ def format_setting(value: str) -> str:
         pass
     return value[:50]
 
-# ---------- Сессия записи ----------
+# ---------- Сессия записи (исправленная) ----------
 class RouletteSession:
     def __init__(self, chat_id: int, roulette_id: int, trigger: str):
         self.chat_id = chat_id
         self.roulette_id = roulette_id
         self.trigger = trigger.lower().strip()
-        self.participants: Dict[int, dict] = {}
-        self.valid_order: List[int] = []
+        self.participants: Dict[int, dict] = {}  # user_id -> данные
 
     def process_message(self, user_id: int, username: Optional[str], message_id: int, text: str) -> Tuple[str, Optional[int], bool]:
         """Возвращает (action, trigger_msg_id_to_delete, need_sub_warning)."""
@@ -242,9 +241,9 @@ class RouletteSession:
             if username:
                 rec['valid'] = True
                 rec['username'] = username
-                self.valid_order.append(user_id)
                 return 'valid', None, True
             else:
+                # Без username, но запись сохраняется (valid=False)
                 return 'no_username', None, False
         else:
             rec['non_trigger_count'] += 1
@@ -255,21 +254,43 @@ class RouletteSession:
                 return 'extra_ignored', None, False
 
     async def finalize(self, bot: Bot) -> List[int]:
-        """Возвращает финальный список user_id, удаляя триггеры исключённых."""
+        """Возвращает финальный список user_id по порядку сообщений, удаляя триггеры исключённых."""
+        # Все, кто отправил триггер (имеет has_trigger)
+        candidates = {uid: rec for uid, rec in self.participants.items() if rec.get('has_trigger')}
+        # Сортируем по message_id
+        sorted_uids = sorted(candidates.keys(), key=lambda uid: candidates[uid]['trigger_msg_id'])
         final = []
-        for uid in self.valid_order:
-            rec = self.participants.get(uid)
-            if not rec or rec['disqualified'] or not rec['valid']:
+        for uid in sorted_uids:
+            rec = candidates[uid]
+            if rec['disqualified']:
                 continue
+            # Проверяем username
             username = rec['username']
             if not username:
                 try:
                     member = await bot.get_chat_member(self.chat_id, uid)
                     username = member.user.username
+                    rec['username'] = username  # обновляем на будущее
                 except:
                     pass
-            if not username or not await check_subscriptions(bot, uid) or is_user_banned(uid, username):
-                # Удаляем триггер исключённого
+            if not username:
+                # Удаляем триггер
+                if rec.get('trigger_msg_id'):
+                    try:
+                        await bot.delete_message(self.chat_id, rec['trigger_msg_id'])
+                    except:
+                        pass
+                continue
+            # Проверяем подписки
+            if not await check_subscriptions(bot, uid):
+                if rec.get('trigger_msg_id'):
+                    try:
+                        await bot.delete_message(self.chat_id, rec['trigger_msg_id'])
+                    except:
+                        pass
+                continue
+            # Проверяем бан
+            if is_user_banned(uid, username):
                 if rec.get('trigger_msg_id'):
                     try:
                         await bot.delete_message(self.chat_id, rec['trigger_msg_id'])
@@ -350,7 +371,6 @@ async def cancel_cmd(message: types.Message, bot: Bot):
     chat_id = message.chat.id
     session = active_sessions.pop(chat_id, None)
     if session:
-        # Удаляем все триггеры участников
         for uid, rec in session.participants.items():
             if rec.get('trigger_msg_id'):
                 try:
@@ -360,7 +380,6 @@ async def cancel_cmd(message: types.Message, bot: Bot):
         enqueue(chat_id, 'send_message', text="❌ Рулетка отменена.")
         update_roulette(session.roulette_id, status='cancelled')
     else:
-        # Проверить запланированную рулетку
         roulette = get_roulette(chat_id, 'waiting_start')
         if roulette:
             update_roulette(roulette['id'], status='cancelled')
@@ -397,9 +416,8 @@ async def random_cmd(message: types.Message, bot: Bot):
     seed, seed_hash = generate_seed_hash()
     numbers = list(range(lo, hi+1))
     winners = select_winners(numbers, winners_count, seed)
-    img = create_random_image(winners, lo, hi, datetime.now(NOVOSIBIRSK), seed_hash)
-    # Отправляем картинку без подписи
-    img_file = BufferedInputFile(img.read(), filename="random.png")
+    img_bytes = create_random_image(winners, lo, hi, datetime.now(NOVOSIBIRSK), seed_hash)
+    img_file = BufferedInputFile(img_bytes.read(), filename="random.png")
     await bot.send_photo(chat_id, photo=img_file)
     enqueue(chat_id, 'send_message', text=f"🔒 Хеш: {seed_hash}\nSeed: {seed}")
     enqueue(chat_id, 'send_message', text=get_verification_instruction(0, seed, [str(n) for n in numbers], [str(w) for w in winners]))
@@ -447,16 +465,15 @@ async def reroll_cmd(message: types.Message, bot: Bot):
             names.append(f"@{m.user.username}" if m.user.username else m.user.full_name)
         except:
             names.append(str(uid))
-    # Номера победителей (1-based)
     winner_numbers = [i+1 for i in final_winners]
-    img = create_result_image(winner_numbers, len(participants), datetime.now(NOVOSIBIRSK), seed_hash)
+    img_bytes = create_result_image(winner_numbers, len(participants), datetime.now(NOVOSIBIRSK), seed_hash)
+    img_file = BufferedInputFile(img_bytes.read(), filename="reroll.png")
     prizes_list = json.loads(last['prizes']) if last['prizes'] else []
     wstr = [f"{num}. {names[i]} (приз: {prizes_list[i] if i < len(prizes_list) else 'не указан'})"
-        for i, num in zip(final_winners, winner_numbers)]
+            for i, num in enumerate(winner_numbers)]
     result = last['result_msg'].replace('{winners}', "\n".join(wstr))
     if old_names:
         result += "\n\nЗачёркнутые лишились призов: " + ", ".join(f"<s>{n}</s>" for n in old_names)
-    img_file = BufferedInputFile(img_bytes.read(), filename="reroll.png")
     await bot.send_photo(chat_id, photo=img_file, caption=result)
     enqueue(chat_id, 'send_message', text=f"🔒 Хеш: {seed_hash}\nSeed: {seed}")
     enqueue(chat_id, 'send_message', text=get_verification_instruction(last['id'], seed, names, [str(num) for num in winner_numbers]))
@@ -495,12 +512,12 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     if stop:
         await send_template(bot, chat_id, stop)
     valid_users = await session.finalize(bot)
-    valid_users.sort(key=lambda uid: session.participants[uid]['trigger_msg_id'])
+    # valid_users уже отсортированы по message_id внутри finalize
     names = []
     for uid in valid_users:
         try:
             m = await bot.get_chat_member(chat_id, uid)
-            names.append(m.user.username)  # без @
+            names.append(m.user.username)
         except:
             names.append(str(uid))
     participants_str = "\n".join(f"{i+1}. {n}" for i, n in enumerate(names))
@@ -514,12 +531,13 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
         winners = select_winners(valid_users, roulette['winners_count'], seed)
         winner_numbers = [valid_users.index(u)+1 for u in winners]
         wnames = [names[valid_users.index(u)] for u in winners]
-        img = create_result_image(winner_numbers, len(valid_users), datetime.now(NOVOSIBIRSK), roulette['seed_hash'])
+        img_bytes = create_result_image(winner_numbers, len(valid_users), datetime.now(NOVOSIBIRSK), roulette['seed_hash'])
+        img_file = BufferedInputFile(img_bytes.read(), filename="result.png")
         prizes = json.loads(roulette['prizes']) if roulette['prizes'] else []
         wstr = [f"{num}. {name} (приз: {prizes[i] if i < len(prizes) else 'не указан'})"
-        for i, (num, name) in enumerate(zip(winner_numbers, wnames))]
+                for i, (num, name) in enumerate(zip(winner_numbers, wnames))]
         result_text = roulette['result_msg'].replace('{winners}', "\n".join(wstr))
-        await bot.send_photo(chat_id, photo=img, caption=result_text)
+        await bot.send_photo(chat_id, photo=img_file, caption=result_text)
         enqueue(chat_id, 'send_message', text=f"🔒 Хеш: {roulette['seed_hash']}\nSeed: {seed}")
         enqueue(chat_id, 'send_message', text=get_verification_instruction(rid, seed, names, [str(num) for num in winner_numbers]))
         update_roulette(rid, status='finished', participants_json=json.dumps(valid_users),
