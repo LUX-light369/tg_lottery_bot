@@ -399,7 +399,8 @@ async def random_cmd(message: types.Message, bot: Bot):
     winners = select_winners(numbers, winners_count, seed)
     img = create_random_image(winners, lo, hi, datetime.now(NOVOSIBIRSK), seed_hash)
     # Отправляем картинку без подписи
-    await bot.send_photo(chat_id, photo=img)
+    img_file = BufferedInputFile(img.read(), filename="random.png")
+    await bot.send_photo(chat_id, photo=img_file)
     enqueue(chat_id, 'send_message', text=f"🔒 Хеш: {seed_hash}\nSeed: {seed}")
     enqueue(chat_id, 'send_message', text=get_verification_instruction(0, seed, [str(n) for n in numbers], [str(w) for w in winners]))
 
@@ -451,11 +452,12 @@ async def reroll_cmd(message: types.Message, bot: Bot):
     img = create_result_image(winner_numbers, len(participants), datetime.now(NOVOSIBIRSK), seed_hash)
     prizes_list = json.loads(last['prizes']) if last['prizes'] else []
     wstr = [f"{num}. {names[i]} (приз: {prizes_list[i] if i < len(prizes_list) else 'не указан'})"
-            for i, num in zip(final_winners, winner_numbers)]
+        for i, num in zip(final_winners, winner_numbers)]
     result = last['result_msg'].replace('{winners}', "\n".join(wstr))
     if old_names:
         result += "\n\nЗачёркнутые лишились призов: " + ", ".join(f"<s>{n}</s>" for n in old_names)
-    await bot.send_photo(chat_id, photo=img, caption=result)
+    img_file = BufferedInputFile(img_bytes.read(), filename="reroll.png")
+    await bot.send_photo(chat_id, photo=img_file, caption=result)
     enqueue(chat_id, 'send_message', text=f"🔒 Хеш: {seed_hash}\nSeed: {seed}")
     enqueue(chat_id, 'send_message', text=get_verification_instruction(last['id'], seed, names, [str(num) for num in winner_numbers]))
     new_id = save_roulette(chat_id, 'finished', last['duration'], len(final_winners),
@@ -515,7 +517,7 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
         img = create_result_image(winner_numbers, len(valid_users), datetime.now(NOVOSIBIRSK), roulette['seed_hash'])
         prizes = json.loads(roulette['prizes']) if roulette['prizes'] else []
         wstr = [f"{num}. {name} (приз: {prizes[i] if i < len(prizes) else 'не указан'})"
-                for num, name in zip(winner_numbers, wnames)]
+        for i, (num, name) in enumerate(zip(winner_numbers, wnames))]
         result_text = roulette['result_msg'].replace('{winners}', "\n".join(wstr))
         await bot.send_photo(chat_id, photo=img, caption=result_text)
         enqueue(chat_id, 'send_message', text=f"🔒 Хеш: {roulette['seed_hash']}\nSeed: {seed}")
