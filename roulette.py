@@ -1,9 +1,9 @@
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple
-import re
 
 import pytz
 from aiogram import Router, F, types, Bot, Dispatcher
@@ -11,8 +11,7 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import ChatPermissions, BufferedInputFile
+from aiogram.types import ChatPermissions, BufferedInputFile, MessageEntity
 
 from database import (
     get_setting, set_setting, get_channels, add_channel, remove_channel,
@@ -21,7 +20,10 @@ from database import (
     get_last_finished_roulette, delete_old_roulettes, get_conn, init_db,
     parse_datetime
 )
-from random_utils import generate_seed_hash, select_winners, create_result_image, get_verification_instruction
+from random_utils import (
+    generate_seed_hash, select_winners,
+    create_result_image, create_random_image, get_verification_instruction
+)
 
 NOVOSIBIRSK = pytz.timezone('Asia/Novosibirsk')
 message_queue = asyncio.Queue()
@@ -29,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 MAIN_ADMIN_ID = None
 
-# ---------- Очередь сообщений ----------
+# ---------- Очередь сообщений (задержка 2 сек) ----------
 async def queue_worker(bot: Bot):
     while True:
         chat_id, method, kwargs = await message_queue.get()
@@ -70,7 +72,7 @@ async def check_subscriptions(bot: Bot, user_id: int) -> bool:
                 logger.info(f"User {user_id} not subscribed to {ch}")
                 return False
         except Exception as e:
-            logger.error(f"Check subscription error for channel {ch}: {e}")
+            logger.error(f"Subscription check error for channel {ch}: {e}")
             return False
     return True
 
@@ -108,7 +110,7 @@ def substitute(template: str, **kwargs) -> str:
     return template
 
 async def send_template(bot: Bot, chat_id: int, template_str: str, **substitutions) -> types.Message:
-    """Отправляет шаблон: текст с entities, пересылка или медиа."""
+    """Отправляет шаблон с поддержкой текста, форматирования и медиа."""
     try:
         data = json.loads(template_str)
         if isinstance(data, dict):
@@ -136,39 +138,68 @@ async def send_template(bot: Bot, chat_id: int, template_str: str, **substitutio
                 text = substitute(data['text'], **substitutions)
                 entities = []
                 if data.get('entities'):
-                    entities = [types.MessageEntity(**e) for e in data['entities']]
+                    for e in data['entities']:
+                        entities.append(MessageEntity(**e))
                 return await bot.send_message(chat_id, text, entities=entities)
     except:
         pass
-    # Обычный текст без форматирования
+    # Обычный текст
     text = substitute(template_str, **substitutions)
     return await bot.send_message(chat_id, text)
 
 def save_media_template(message: types.Message) -> str:
-    """Сохраняет шаблон с поддержкой форматирования."""
+    """Сохраняет шаблон с поддержкой медиа, пересылки и форматирования."""
     if message.forward_from_chat and message.forward_from_message_id:
-        return json.dumps({'type': 'forward', 'chat_id': message.forward_from_chat.id,
-                           'message_id': message.forward_from_message_id})
+        return json.dumps({
+            'type': 'forward',
+            'chat_id': message.forward_from_chat.id,
+            'message_id': message.forward_from_message_id
+        })
     if message.photo:
         file_id = message.photo[-1].file_id
-        return json.dumps({'type': 'media', 'media_type': 'photo', 'file_id': file_id,
-                           'caption': message.caption or '', 'entities': message.caption_entities or []})
+        return json.dumps({
+            'type': 'media', 'media_type': 'photo', 'file_id': file_id,
+            'caption': message.caption or '', 'entities': []
+        })
     if message.video:
-        return json.dumps({'type': 'media', 'media_type': 'video', 'file_id': message.video.file_id,
-                           'caption': message.caption or '', 'entities': message.caption_entities or []})
+        return json.dumps({
+            'type': 'media', 'media_type': 'video', 'file_id': message.video.file_id,
+            'caption': message.caption or '', 'entities': []
+        })
     if message.animation:
-        return json.dumps({'type': 'media', 'media_type': 'animation', 'file_id': message.animation.file_id,
-                           'caption': message.caption or '', 'entities': message.caption_entities or []})
+        return json.dumps({
+            'type': 'media', 'media_type': 'animation', 'file_id': message.animation.file_id,
+            'caption': message.caption or '', 'entities': []
+        })
     if message.document:
-        return json.dumps({'type': 'media', 'media_type': 'document', 'file_id': message.document.file_id,
-                           'caption': message.caption or '', 'entities': message.caption_entities or []})
+        return json.dumps({
+            'type': 'media', 'media_type': 'document', 'file_id': message.document.file_id,
+            'caption': message.caption or '', 'entities': []
+        })
     # Текст с entities
-    if message.text and (message.entities or message.text):
-        entities = []
-        if message.entities:
-            entities = [e.model_dump() for e in message.entities]
-        return json.dumps({'type': 'text', 'text': message.text, 'entities': entities})
-    return message.text or message.caption or ''
+    entities = []
+    if message.entities:
+        entities = [ent.model_dump() for ent in message.entities]
+    return json.dumps({
+        'type': 'text',
+        'text': message.text or '',
+        'entities': entities
+    })
+
+def format_setting(value: str) -> str:
+    """Преобразует сохранённое значение в читаемый вид для настроек."""
+    try:
+        data = json.loads(value)
+        if isinstance(data, dict):
+            if data.get('type') == 'text':
+                return data.get('text', '')[:50] + ('...' if len(data.get('text',''))>50 else '')
+            elif data.get('type') == 'media':
+                return f"[{data.get('media_type','медиа')}]"
+            elif data.get('type') == 'forward':
+                return "[пересланное сообщение]"
+    except:
+        pass
+    return value[:50]
 
 # ---------- Сессия записи ----------
 class RouletteSession:
@@ -179,9 +210,10 @@ class RouletteSession:
         self.participants: Dict[int, dict] = {}
         self.valid_order: List[int] = []
 
-    def process_message(self, user_id: int, username: Optional[str], message_id: int, text: str) -> Tuple[str, Optional[int]]:
+    def process_message(self, user_id: int, username: Optional[str], message_id: int, text: str) -> Tuple[str, Optional[int], bool]:
+        """Возвращает (action, trigger_msg_id_to_delete, need_sub_warning)."""
         if is_user_banned(user_id, username):
-            return 'banned', None
+            return 'banned', None, False
 
         cleaned = text.strip().lower()
         is_trigger = (cleaned == self.trigger)
@@ -199,30 +231,31 @@ class RouletteSession:
             self.participants[user_id] = rec
 
         if rec['disqualified']:
-            return 'disqualified', rec.get('trigger_msg_id')
+            return 'disqualified', rec.get('trigger_msg_id'), False
 
         if is_trigger:
             if rec['has_trigger']:
                 rec['disqualified'] = True
-                return 'disqualified', rec.get('trigger_msg_id')
+                return 'disqualified', rec.get('trigger_msg_id'), False
             rec['has_trigger'] = True
             rec['trigger_msg_id'] = message_id
             if username:
                 rec['valid'] = True
                 rec['username'] = username
                 self.valid_order.append(user_id)
-                return 'valid', None
+                return 'valid', None, True
             else:
-                return 'no_username', None
+                return 'no_username', None, False
         else:
             rec['non_trigger_count'] += 1
             if rec['non_trigger_count'] >= 2:
                 rec['disqualified'] = True
-                return 'disqualified', rec.get('trigger_msg_id')
+                return 'disqualified', rec.get('trigger_msg_id'), False
             else:
-                return 'extra_ignored', None
+                return 'extra_ignored', None, False
 
     async def finalize(self, bot: Bot) -> List[int]:
+        """Возвращает финальный список user_id, удаляя триггеры исключённых."""
         final = []
         for uid in self.valid_order:
             rec = self.participants.get(uid)
@@ -234,8 +267,14 @@ class RouletteSession:
                     member = await bot.get_chat_member(self.chat_id, uid)
                     username = member.user.username
                 except:
-                    continue
+                    pass
             if not username or not await check_subscriptions(bot, uid) or is_user_banned(uid, username):
+                # Удаляем триггер исключённого
+                if rec.get('trigger_msg_id'):
+                    try:
+                        await bot.delete_message(self.chat_id, rec['trigger_msg_id'])
+                    except:
+                        pass
                 continue
             final.append(uid)
         return final
@@ -284,7 +323,6 @@ async def roulette_cmd(message: types.Message, bot: Bot):
     else:
         start_time = now + timedelta(seconds=5)
     stop_time = start_time + timedelta(minutes=duration)
-    # Генерируем seed и хеш сразу
     seed, seed_hash = generate_seed_hash()
     rid = save_roulette(chat_id, 'waiting_start', duration, winners or 0,
                         trigger, prizes_str, get_setting('rules'),
@@ -303,6 +341,67 @@ async def roulette_cmd(message: types.Message, bot: Bot):
         asyncio.create_task(schedule_start(bot, chat_id, rid, (start_time - now).total_seconds()))
     else:
         await start_recording(bot, chat_id, rid)
+
+# ---------- @отмена ----------
+@admin_router.message(F.text.regexp(r'@отмена'))
+async def cancel_cmd(message: types.Message, bot: Bot):
+    if not await is_admin(bot, message.chat.id, message.from_user.id):
+        return
+    chat_id = message.chat.id
+    session = active_sessions.pop(chat_id, None)
+    if session:
+        # Удаляем все триггеры участников
+        for uid, rec in session.participants.items():
+            if rec.get('trigger_msg_id'):
+                try:
+                    await bot.delete_message(chat_id, rec['trigger_msg_id'])
+                except:
+                    pass
+        enqueue(chat_id, 'send_message', text="❌ Рулетка отменена.")
+        update_roulette(session.roulette_id, status='cancelled')
+    else:
+        # Проверить запланированную рулетку
+        roulette = get_roulette(chat_id, 'waiting_start')
+        if roulette:
+            update_roulette(roulette['id'], status='cancelled')
+            enqueue(chat_id, 'send_message', text="❌ Запланированная рулетка отменена.")
+        else:
+            enqueue(chat_id, 'send_message', text="Нет активных рулеток для отмены.")
+
+# ---------- @рандом ----------
+@admin_router.message(F.text.regexp(r'@рандом\s+(.+)'))
+async def random_cmd(message: types.Message, bot: Bot):
+    if not await is_admin(bot, message.chat.id, message.from_user.id):
+        return
+    chat_id = message.chat.id
+    args = message.text.split('@рандом', 1)[1].strip()
+    winners_count = None
+    range_str = None
+    parts = args.split()
+    for p in parts:
+        if p.endswith('п') and p[:-1].isdigit():
+            winners_count = int(p[:-1])
+        elif re.match(r'^\d+-\d+$', p):
+            range_str = p
+    if not winners_count or not range_str:
+        await message.reply("Формат: @рандом 2п 1-90")
+        return
+    try:
+        lo, hi = map(int, range_str.split('-'))
+    except:
+        await message.reply("Неверный диапазон.")
+        return
+    if winners_count > (hi - lo + 1):
+        await message.reply("Победителей больше, чем чисел в диапазоне.")
+        return
+    seed, seed_hash = generate_seed_hash()
+    numbers = list(range(lo, hi+1))
+    winners = select_winners(numbers, winners_count, seed)
+    img = create_random_image(winners, lo, hi, datetime.now(NOVOSIBIRSK), seed_hash)
+    # Отправляем картинку без подписи
+    await bot.send_photo(chat_id, photo=img)
+    enqueue(chat_id, 'send_message', text=f"🔒 Хеш: {seed_hash}\nSeed: {seed}")
+    enqueue(chat_id, 'send_message', text=get_verification_instruction(0, seed, [str(n) for n in numbers], [str(w) for w in winners]))
 
 # ---------- @перекрут ----------
 @admin_router.message(F.text.regexp(r'@перекрут\s+(.+)'))
@@ -347,19 +446,18 @@ async def reroll_cmd(message: types.Message, bot: Bot):
             names.append(f"@{m.user.username}" if m.user.username else m.user.full_name)
         except:
             names.append(str(uid))
-    wnames = [names[i] for i in final_winners]
-    # Картинка – обернём BytesIO в BufferedInputFile
-    img_bytes = create_result_image(wnames, len(participants), datetime.now(NOVOSIBIRSK), seed_hash)
-    img_file = BufferedInputFile(img_bytes.read(), filename="result.png")
+    # Номера победителей (1-based)
+    winner_numbers = [i+1 for i in final_winners]
+    img = create_result_image(winner_numbers, len(participants), datetime.now(NOVOSIBIRSK), seed_hash)
     prizes_list = json.loads(last['prizes']) if last['prizes'] else []
-    wstr = [f"{i+1}. {name} (приз: {prizes_list[i] if i < len(prizes_list) else 'не указан'})"
-            for i, name in enumerate(wnames)]
+    wstr = [f"{num}. {names[i]} (приз: {prizes_list[i] if i < len(prizes_list) else 'не указан'})"
+            for i, num in zip(final_winners, winner_numbers)]
     result = last['result_msg'].replace('{winners}', "\n".join(wstr))
     if old_names:
         result += "\n\nЗачёркнутые лишились призов: " + ", ".join(f"<s>{n}</s>" for n in old_names)
-    await bot.send_photo(chat_id, photo=img_file, caption=result)
+    await bot.send_photo(chat_id, photo=img, caption=result)
     enqueue(chat_id, 'send_message', text=f"🔒 Хеш: {seed_hash}\nSeed: {seed}")
-    enqueue(chat_id, 'send_message', text=get_verification_instruction(last['id'], seed, names, wnames))
+    enqueue(chat_id, 'send_message', text=get_verification_instruction(last['id'], seed, names, [str(num) for num in winner_numbers]))
     new_id = save_roulette(chat_id, 'finished', last['duration'], len(final_winners),
                            last['trigger'], last['prizes'], last['rules'], last['start_msg'],
                            last['stop_msg'], last['result_msg'], datetime.now(NOVOSIBIRSK),
@@ -376,7 +474,6 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     roulette = get_roulette_by_id(rid)
     if not roulette or roulette['status'] != 'waiting_start':
         return
-    # Правила (в них тоже можно подставить seed_hash, если нужно)
     rules = roulette['rules']
     if rules:
         await send_template(bot, chat_id, rules, trigger=roulette['trigger'],
@@ -404,7 +501,6 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
             names.append(m.user.username)  # без @
         except:
             names.append(str(uid))
-    # Вывод списка без @
     participants_str = "\n".join(f"{i+1}. {n}" for i, n in enumerate(names))
     enqueue(chat_id, 'send_message', text=f"📋 Участники ({len(valid_users)}):\n{participants_str}")
     try:
@@ -413,18 +509,17 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
         pass
     if roulette['winners_count'] > 0:
         seed = roulette['seed']
-        # Победители определяются по сохранённому seed
         winners = select_winners(valid_users, roulette['winners_count'], seed)
+        winner_numbers = [valid_users.index(u)+1 for u in winners]
         wnames = [names[valid_users.index(u)] for u in winners]
-        img_bytes = create_result_image(wnames, len(valid_users), datetime.now(NOVOSIBIRSK), roulette['seed_hash'])
-        img_file = BufferedInputFile(img_bytes.read(), filename="result.png")
+        img = create_result_image(winner_numbers, len(valid_users), datetime.now(NOVOSIBIRSK), roulette['seed_hash'])
         prizes = json.loads(roulette['prizes']) if roulette['prizes'] else []
-        wstr = [f"{i+1}. {name} (приз: {prizes[i] if i < len(prizes) else 'не указан'})"
-                for i, name in enumerate(wnames)]
+        wstr = [f"{num}. {name} (приз: {prizes[i] if i < len(prizes) else 'не указан'})"
+                for num, name in zip(winner_numbers, wnames)]
         result_text = roulette['result_msg'].replace('{winners}', "\n".join(wstr))
-        await bot.send_photo(chat_id, photo=img_file, caption=result_text)
+        await bot.send_photo(chat_id, photo=img, caption=result_text)
         enqueue(chat_id, 'send_message', text=f"🔒 Хеш: {roulette['seed_hash']}\nSeed: {seed}")
-        enqueue(chat_id, 'send_message', text=get_verification_instruction(rid, seed, names, wnames))
+        enqueue(chat_id, 'send_message', text=get_verification_instruction(rid, seed, names, [str(num) for num in winner_numbers]))
         update_roulette(rid, status='finished', participants_json=json.dumps(valid_users),
                         winners_json=json.dumps([valid_users.index(u) for u in winners]))
     else:
@@ -451,9 +546,11 @@ async def filter_msg(message: types.Message, bot: Bot):
     user_id = message.from_user.id
     username = parse_username(message.from_user)
     text = message.text or message.caption or ""
-    action, trigger_to_delete = session.process_message(user_id, username, message.message_id, text)
+    action, trigger_to_delete, need_sub_check = session.process_message(user_id, username, message.message_id, text)
 
     if action == 'valid':
+        if not await check_subscriptions(bot, user_id):
+            await message.reply("⚠️ Вы не подписаны на обязательные каналы. Подпишитесь до конца записи, иначе ваш голос не зачтётся.")
         return
     elif action == 'no_username':
         await message.reply("⚠️ Нужен @username. Установите до конца записи.")
@@ -465,7 +562,6 @@ async def filter_msg(message: types.Message, bot: Bot):
             except:
                 pass
         await mute_user(bot, message.chat.id, user_id)
-        # Уведомление с юзернеймом
         mention = f"@{username}" if username else message.from_user.full_name
         enqueue(message.chat.id, 'send_message', text=f"⛔ {mention} дисквалифицирован.")
     elif action == 'extra_ignored':
@@ -474,6 +570,7 @@ async def filter_msg(message: types.Message, bot: Bot):
         await message.delete()
     elif action == 'banned':
         await message.delete()
+        await mute_user(bot, message.chat.id, user_id)
         mention = f"@{username}" if username else message.from_user.full_name
         enqueue(message.chat.id, 'send_message', text=f"🚫 {mention}, вы забанены.")
 
@@ -492,10 +589,7 @@ class SettingsForm(StatesGroup):
     waiting_for_ban = State()
     waiting_for_max = State()
 
-@admin_router.message(Command('menu'))
-async def menu(message: types.Message):
-    if message.from_user.id != MAIN_ADMIN_ID:
-        return
+def build_menu_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="📌 Текущие настройки", callback_data="view")
     kb.button(text="💬 Чат проведения", callback_data="set_chat")
@@ -510,18 +604,23 @@ async def menu(message: types.Message):
     kb.button(text="🚫 Баны", callback_data="ban_menu")
     kb.button(text="👥 Макс. участников", callback_data="set_max")
     kb.adjust(2)
-    await message.answer("Настройки:", reply_markup=kb.as_markup())
+    return kb.as_markup()
+
+@admin_router.message(Command('menu'))
+async def menu(message: types.Message):
+    if message.from_user.id != MAIN_ADMIN_ID:
+        return
+    await message.answer("Настройки:", reply_markup=build_menu_kb())
 
 def back_btn():
     kb = InlineKeyboardBuilder()
     kb.button(text="« Назад", callback_data="back_to_menu")
     return kb.as_markup()
 
-# Приоритетный коллбэк для кнопки «Назад», сбрасывает FSM
 @admin_router.callback_query(F.data == "back_to_menu")
 async def back_menu(call: types.CallbackQuery, state: FSMContext):
-    await state.clear()  # сброс любого состояния
-    await menu(call.message)
+    await state.clear()
+    await call.message.edit_text("Настройки:", reply_markup=build_menu_kb())
 
 @admin_router.callback_query(F.data == "view")
 async def view_settings(call: types.CallbackQuery):
@@ -532,13 +631,14 @@ async def view_settings(call: types.CallbackQuery):
 Чат: {get_setting('chat_id') or 'не задан'}
 Каналы: {', '.join(get_channels()) or 'нет'}
 Призы: {get_setting('prizes') or 'нет'}
-Правила: {get_setting('rules') or '...'}
-Старт: {get_setting('start_msg') or '...'}
-Стоп: {get_setting('stop_msg') or '...'}
-Результат: {get_setting('result_msg') or '...'}"""
-    await call.message.edit_text(s, reply_markup=back_btn())
+Правила: {format_setting(get_setting('rules'))}
+Старт: {format_setting(get_setting('start_msg'))}
+Стоп: {format_setting(get_setting('stop_msg'))}
+Результат: {format_setting(get_setting('result_msg'))}"""
+    await call.message.edit_text(s, reply_markup=back_btn(), parse_mode='HTML')
     await call.answer()
 
+# ---------- Обработчики настроек (каждый с FSM) ----------
 @admin_router.callback_query(F.data == "set_chat")
 async def set_chat_start(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text("Введите ID чата (текущий: " +
