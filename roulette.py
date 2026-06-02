@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 MAIN_ADMIN_ID = None
 
-# ---------- Очередь сообщений (задержка 2 сек) ----------
+# ---------- Очередь сообщений ----------
 async def queue_worker(bot: Bot):
     while True:
         chat_id, method, kwargs = await message_queue.get()
@@ -62,17 +62,12 @@ async def is_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
         return False
 
 async def check_subscriptions(bot: Bot, user_id: int) -> bool:
-    channels = get_channels()
-    if not channels:
-        return True
-    for ch in channels:
+    for ch in get_channels():
         try:
             member = await bot.get_chat_member(ch, user_id)
             if member.status in ['left', 'kicked']:
-                logger.info(f"User {user_id} not subscribed to {ch}")
                 return False
-        except Exception as e:
-            logger.error(f"Subscription check error for channel {ch}: {e}")
+        except:
             return False
     return True
 
@@ -82,25 +77,20 @@ def parse_username(user: types.User) -> Optional[str]:
 async def mute_user(bot: Bot, chat_id: int, user_id: int, minutes: int = 60):
     until = datetime.now() + timedelta(minutes=minutes)
     try:
-        await bot.restrict_chat_member(
-            chat_id, user_id,
-            permissions=ChatPermissions(can_send_messages=False),
-            until_date=until
-        )
+        await bot.restrict_chat_member(chat_id, user_id,
+                                       permissions=ChatPermissions(can_send_messages=False),
+                                       until_date=until)
     except Exception as e:
         logger.error(f"Mute error: {e}")
 
 async def unmute_user(bot: Bot, chat_id: int, user_id: int):
     try:
-        await bot.restrict_chat_member(
-            chat_id, user_id,
-            permissions=ChatPermissions(
-                can_send_messages=True,
-                can_send_media_messages=True,
-                can_send_other_messages=True,
-                can_add_web_page_previews=True
-            )
-        )
+        await bot.restrict_chat_member(chat_id, user_id,
+                                       permissions=ChatPermissions(
+                                           can_send_messages=True,
+                                           can_send_media_messages=True,
+                                           can_send_other_messages=True,
+                                           can_add_web_page_previews=True))
     except:
         pass
 
@@ -110,16 +100,13 @@ def substitute(template: str, **kwargs) -> str:
     return template
 
 async def send_template(bot: Bot, chat_id: int, template_str: str, **substitutions) -> types.Message:
-    """Отправляет шаблон с поддержкой текста, форматирования и медиа."""
     try:
         data = json.loads(template_str)
         if isinstance(data, dict):
             if data.get('type') == 'forward':
-                return await bot.copy_message(
-                    chat_id=chat_id,
-                    from_chat_id=data['chat_id'],
-                    message_id=data['message_id']
-                )
+                return await bot.copy_message(chat_id=chat_id,
+                                              from_chat_id=data['chat_id'],
+                                              message_id=data['message_id'])
             elif data.get('type') == 'media':
                 media_type = data['media_type']
                 file_id = data['file_id']
@@ -143,51 +130,31 @@ async def send_template(bot: Bot, chat_id: int, template_str: str, **substitutio
                 return await bot.send_message(chat_id, text, entities=entities)
     except:
         pass
-    # Обычный текст
     text = substitute(template_str, **substitutions)
     return await bot.send_message(chat_id, text)
 
 def save_media_template(message: types.Message) -> str:
-    """Сохраняет шаблон с поддержкой медиа, пересылки и форматирования."""
     if message.forward_from_chat and message.forward_from_message_id:
-        return json.dumps({
-            'type': 'forward',
-            'chat_id': message.forward_from_chat.id,
-            'message_id': message.forward_from_message_id
-        })
+        return json.dumps({'type': 'forward', 'chat_id': message.forward_from_chat.id,
+                           'message_id': message.forward_from_message_id})
     if message.photo:
-        file_id = message.photo[-1].file_id
-        return json.dumps({
-            'type': 'media', 'media_type': 'photo', 'file_id': file_id,
-            'caption': message.caption or '', 'entities': []
-        })
+        return json.dumps({'type': 'media', 'media_type': 'photo', 'file_id': message.photo[-1].file_id,
+                           'caption': message.caption or '', 'entities': []})
     if message.video:
-        return json.dumps({
-            'type': 'media', 'media_type': 'video', 'file_id': message.video.file_id,
-            'caption': message.caption or '', 'entities': []
-        })
+        return json.dumps({'type': 'media', 'media_type': 'video', 'file_id': message.video.file_id,
+                           'caption': message.caption or '', 'entities': []})
     if message.animation:
-        return json.dumps({
-            'type': 'media', 'media_type': 'animation', 'file_id': message.animation.file_id,
-            'caption': message.caption or '', 'entities': []
-        })
+        return json.dumps({'type': 'media', 'media_type': 'animation', 'file_id': message.animation.file_id,
+                           'caption': message.caption or '', 'entities': []})
     if message.document:
-        return json.dumps({
-            'type': 'media', 'media_type': 'document', 'file_id': message.document.file_id,
-            'caption': message.caption or '', 'entities': []
-        })
-    # Текст с entities
+        return json.dumps({'type': 'media', 'media_type': 'document', 'file_id': message.document.file_id,
+                           'caption': message.caption or '', 'entities': []})
     entities = []
     if message.entities:
         entities = [ent.model_dump() for ent in message.entities]
-    return json.dumps({
-        'type': 'text',
-        'text': message.text or '',
-        'entities': entities
-    })
+    return json.dumps({'type': 'text', 'text': message.text or '', 'entities': entities})
 
 def format_setting(value: str) -> str:
-    """Преобразует сохранённое значение в читаемый вид для настроек."""
     try:
         data = json.loads(value)
         if isinstance(data, dict):
@@ -213,25 +180,15 @@ class RouletteSession:
     def process_message(self, user_id: int, username: Optional[str], message_id: int, text: str) -> Tuple[str, Optional[int], bool]:
         if is_user_banned(user_id, username):
             return 'banned', None, False
-
         cleaned = text.strip().lower()
         is_trigger = (cleaned == self.trigger)
-
         rec = self.participants.get(user_id)
         if not rec:
-            rec = {
-                'username': username,
-                'valid': False,
-                'disqualified': False,
-                'non_trigger_count': 0,
-                'has_trigger': False,
-                'trigger_msg_id': None
-            }
+            rec = {'username': username, 'valid': False, 'disqualified': False,
+                   'non_trigger_count': 0, 'has_trigger': False, 'trigger_msg_id': None}
             self.participants[user_id] = rec
-
         if rec['disqualified']:
             return 'disqualified', rec.get('trigger_msg_id'), False
-
         if is_trigger:
             if rec['has_trigger']:
                 rec['disqualified'] = True
@@ -249,8 +206,7 @@ class RouletteSession:
             if rec['non_trigger_count'] >= 2:
                 rec['disqualified'] = True
                 return 'disqualified', rec.get('trigger_msg_id'), False
-            else:
-                return 'extra_ignored', None, False
+            return 'extra_ignored', None, False
 
     async def finalize(self, bot: Bot) -> List[int]:
         candidates = {uid: rec for uid, rec in self.participants.items() if rec.get('has_trigger')}
@@ -260,14 +216,13 @@ class RouletteSession:
             rec = candidates[uid]
             if rec['disqualified']:
                 continue
-            username = rec['username']
-            if not username:
-                try:
-                    member = await bot.get_chat_member(self.chat_id, uid)
-                    username = member.user.username
-                    rec['username'] = username
-                except:
-                    pass
+            # Всегда проверяем актуальный username
+            username = None
+            try:
+                member = await bot.get_chat_member(self.chat_id, uid)
+                username = member.user.username
+            except:
+                pass
             if not username or not await check_subscriptions(bot, uid) or is_user_banned(uid, username):
                 if rec.get('trigger_msg_id'):
                     try:
@@ -330,13 +285,11 @@ async def roulette_cmd(message: types.Message, bot: Bot):
                         get_setting('start_msg'), get_setting('stop_msg'),
                         get_setting('result_msg'), start_time, stop_time,
                         seed=seed, seed_hash=seed_hash)
-    announce = (
-        f"📢 Рулетка:\n"
-        f"Победителей: {winners if winners else 'нет (админ сам)'}\n"
-        f"Длительность: {duration} мин.\n"
-        f"Старт: {start_time.strftime('%d.%m.%Y %H:%M')} (НСК)\n"
-        f"🔒 Хеш честности: {seed_hash}"
-    )
+    announce = (f"📢 Рулетка:\n"
+                f"Победителей: {winners if winners else 'нет (админ сам)'}\n"
+                f"Длительность: {duration} мин.\n"
+                f"Старт: {start_time.strftime('%d.%m.%Y %H:%M')} (НСК)\n"
+                f"🔒 Хеш честности: {seed_hash}")
     enqueue(chat_id, 'send_message', text=announce)
     if start_time > now:
         asyncio.create_task(schedule_start(bot, chat_id, rid, (start_time - now).total_seconds()))
@@ -376,8 +329,7 @@ async def random_cmd(message: types.Message, bot: Bot):
     args = message.text.split('@рандом', 1)[1].strip()
     winners_count = None
     range_str = None
-    parts = args.split()
-    for p in parts:
+    for p in args.split():
         if p.endswith('п') and p[:-1].isdigit():
             winners_count = int(p[:-1])
         elif re.match(r'^\d+-\d+$', p):
@@ -455,8 +407,7 @@ async def reroll_cmd(message: types.Message, bot: Bot):
     if old_names:
         result += "\n\nЗачёркнутые лишились призов: " + ", ".join(f"<s>{n}</s>" for n in old_names)
     if len(result) > 1024:
-        result = result[:1000] + "\n...\n(полный список ниже)"
-        await bot.send_photo(chat_id, photo=img_file, caption=result)
+        await bot.send_photo(chat_id, photo=img_file, caption=result[:1020] + "...")
         await bot.send_message(chat_id, "\n".join(wstr))
     else:
         await bot.send_photo(chat_id, photo=img_file, caption=result)
@@ -469,7 +420,7 @@ async def reroll_cmd(message: types.Message, bot: Bot):
     update_roulette(new_id, participants_json=json.dumps(participants),
                     winners_json=json.dumps(final_winners), re_rolled_from=last['id'])
 
-# ---------- Логика старта и записи (все сообщения через очередь с задержкой) ----------
+# ---------- Логика старта и записи ----------
 async def schedule_start(bot, chat_id, rid, delay):
     await asyncio.sleep(delay)
     await start_recording(bot, chat_id, rid)
@@ -478,7 +429,7 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     roulette = get_roulette_by_id(rid)
     if not roulette or roulette['status'] != 'waiting_start':
         return
-    # Правила – через очередь (чтобы была задержка 2 сек)
+    # Правила
     rules = roulette['rules']
     if rules:
         await send_template(bot, chat_id, rules, trigger=roulette['trigger'],
@@ -489,7 +440,6 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     if start:
         await send_template(bot, chat_id, start, trigger=roulette['trigger'])
         await asyncio.sleep(2)
-
     session = RouletteSession(chat_id, rid, roulette['trigger'])
     active_sessions[chat_id] = session
     update_roulette(rid, status='recording')
@@ -503,9 +453,8 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     if stop:
         await send_template(bot, chat_id, stop)
         await asyncio.sleep(2)
-
     valid_users = await session.finalize(bot)
-    # Формируем имена (без None)
+    # Имена: без @ для чата, с @ для админа
     names_clean = []
     names_with_at = []
     for uid in valid_users:
@@ -542,8 +491,7 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
                 for i, (num, name) in enumerate(zip(winner_numbers, wnames_clean))]
         result_text = roulette['result_msg'].replace('{winners}', "\n".join(wstr))
         if len(result_text) > 1024:
-            result_text = result_text[:1000] + "\n...\n(полный список ниже)"
-            await bot.send_photo(chat_id, photo=img_file, caption=result_text)
+            await bot.send_photo(chat_id, photo=img_file, caption=result_text[:1020] + "...")
             await bot.send_message(chat_id, "\n".join(wstr))
         else:
             await bot.send_photo(chat_id, photo=img_file, caption=result_text)
@@ -605,7 +553,7 @@ async def filter_msg(message: types.Message, bot: Bot):
         mention = f"@{username}" if username else message.from_user.full_name
         enqueue(message.chat.id, 'send_message', text=f"🚫 {mention}, вы забанены.")
 
-# ---------- Меню настроек (полный FSM) ----------
+# ---------- Меню настроек ----------
 class SettingsForm(StatesGroup):
     waiting_for_chat_id = State()
     waiting_for_duration = State()
@@ -669,7 +617,6 @@ async def view_settings(call: types.CallbackQuery):
     await call.message.edit_text(s, reply_markup=back_btn(), parse_mode='HTML')
     await call.answer()
 
-# Обработчики для каждой настройки (чат, длительность, триггер, призы, правила, старт, стоп, результат, каналы, баны, макс участников)
 @admin_router.callback_query(F.data == "set_chat")
 async def set_chat_start(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text("Введите ID чата (текущий: " +
