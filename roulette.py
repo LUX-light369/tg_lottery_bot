@@ -201,17 +201,16 @@ def format_setting(value: str) -> str:
         pass
     return value[:50]
 
-# ---------- Сессия записи (исправленная) ----------
+# ---------- Сессия записи ----------
 class RouletteSession:
     def __init__(self, chat_id: int, roulette_id: int, trigger: str):
         self.chat_id = chat_id
         self.roulette_id = roulette_id
         self.trigger = trigger.lower().strip()
-        self.participants: Dict[int, dict] = {}  # user_id -> данные
-        self.muted_users: set = set()  # user_id, кого замьютили за нарушения
+        self.participants: Dict[int, dict] = {}
+        self.muted_users: set = set()
 
     def process_message(self, user_id: int, username: Optional[str], message_id: int, text: str) -> Tuple[str, Optional[int], bool]:
-        """Возвращает (action, trigger_msg_id_to_delete, need_sub_warning)."""
         if is_user_banned(user_id, username):
             return 'banned', None, False
 
@@ -244,7 +243,6 @@ class RouletteSession:
                 rec['username'] = username
                 return 'valid', None, True
             else:
-                # Без username, запись сохраняется (valid=False)
                 return 'no_username', None, False
         else:
             rec['non_trigger_count'] += 1
@@ -255,8 +253,6 @@ class RouletteSession:
                 return 'extra_ignored', None, False
 
     async def finalize(self, bot: Bot) -> List[int]:
-        """Возвращает финальный список user_id по порядку сообщений, удаляя триггеры исключённых."""
-        # Собираем всех, кто отправил триггер
         candidates = {uid: rec for uid, rec in self.participants.items() if rec.get('has_trigger')}
         sorted_uids = sorted(candidates.keys(), key=lambda uid: candidates[uid]['trigger_msg_id'])
         final = []
@@ -264,7 +260,6 @@ class RouletteSession:
             rec = candidates[uid]
             if rec['disqualified']:
                 continue
-            # Проверяем username
             username = rec['username']
             if not username:
                 try:
@@ -274,13 +269,11 @@ class RouletteSession:
                 except:
                     pass
             if not username or not await check_subscriptions(bot, uid) or is_user_banned(uid, username):
-                # Удаляем триггер и запись из участников
                 if rec.get('trigger_msg_id'):
                     try:
                         await bot.delete_message(self.chat_id, rec['trigger_msg_id'])
                     except:
                         pass
-                # Удаляем из participants, чтобы не мешался
                 if uid in self.participants:
                     del self.participants[uid]
                 continue
@@ -464,7 +457,7 @@ async def reroll_cmd(message: types.Message, bot: Bot):
     if len(result) > 1024:
         result = result[:1000] + "\n...\n(полный список ниже)"
         await bot.send_photo(chat_id, photo=img_file, caption=result)
-        await bot.send_message(chat_id, "\n".join(wstr))  # отправим полный список отдельным сообщением
+        await bot.send_message(chat_id, "\n".join(wstr))
     else:
         await bot.send_photo(chat_id, photo=img_file, caption=result)
     enqueue(chat_id, 'send_message', text=f"🔒 Хеш: {seed_hash}\nSeed: {seed}")
@@ -476,7 +469,7 @@ async def reroll_cmd(message: types.Message, bot: Bot):
     update_roulette(new_id, participants_json=json.dumps(participants),
                     winners_json=json.dumps(final_winners), re_rolled_from=last['id'])
 
-# ---------- Логика старта и записи ----------
+# ---------- Логика старта и записи (все сообщения через очередь с задержкой) ----------
 async def schedule_start(bot, chat_id, rid, delay):
     await asyncio.sleep(delay)
     await start_recording(bot, chat_id, rid)
@@ -485,13 +478,18 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     roulette = get_roulette_by_id(rid)
     if not roulette or roulette['status'] != 'waiting_start':
         return
+    # Правила – через очередь (чтобы была задержка 2 сек)
     rules = roulette['rules']
     if rules:
         await send_template(bot, chat_id, rules, trigger=roulette['trigger'],
                             duration=str(roulette['duration']), seed_hash=roulette.get('seed_hash',''))
+        await asyncio.sleep(2)
+    # Старт
     start = roulette['start_msg']
     if start:
         await send_template(bot, chat_id, start, trigger=roulette['trigger'])
+        await asyncio.sleep(2)
+
     session = RouletteSession(chat_id, rid, roulette['trigger'])
     active_sessions[chat_id] = session
     update_roulette(rid, status='recording')
@@ -500,20 +498,27 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     delay = (stop_time - datetime.now(NOVOSIBIRSK)).total_seconds()
     if delay > 0:
         await asyncio.sleep(delay)
+    # Стоп
     stop = roulette['stop_msg']
     if stop:
         await send_template(bot, chat_id, stop)
+        await asyncio.sleep(2)
+
     valid_users = await session.finalize(bot)
-    # valid_users уже отсортированы по message_id внутри finalize
-    # Формируем список с @ для ЛС и без @ для чата
-    names_with_at = []
+    # Формируем имена (без None)
     names_clean = []
+    names_with_at = []
     for uid in valid_users:
         try:
             m = await bot.get_chat_member(chat_id, uid)
-            username = m.user.username
-            names_clean.append(username)
-            names_with_at.append(f"@{username}" if username else m.user.full_name)
+            uname = m.user.username
+            if uname:
+                names_clean.append(uname)
+                names_with_at.append(f"@{uname}")
+            else:
+                full = m.user.full_name
+                names_clean.append(full)
+                names_with_at.append(full)
         except:
             names_clean.append(str(uid))
             names_with_at.append(str(uid))
@@ -530,11 +535,9 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
         winners = select_winners(valid_users, roulette['winners_count'], seed)
         winner_numbers = [valid_users.index(u)+1 for u in winners]
         wnames_clean = [names_clean[valid_users.index(u)] for u in winners]
-        wnames_with_at = [names_with_at[valid_users.index(u)] for u in winners]
         img_bytes = create_result_image(winner_numbers, len(valid_users), datetime.now(NOVOSIBIRSK), roulette['seed_hash'])
         img_file = BufferedInputFile(img_bytes.read(), filename="result.png")
         prizes = json.loads(roulette['prizes']) if roulette['prizes'] else []
-        # Текст для подписи с призами
         wstr = [f"{num}. {name} (приз: {prizes[i] if i < len(prizes) else 'не указан'})"
                 for i, (num, name) in enumerate(zip(winner_numbers, wnames_clean))]
         result_text = roulette['result_msg'].replace('{winners}', "\n".join(wstr))
@@ -551,7 +554,7 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     else:
         update_roulette(rid, status='finished', participants_json=json.dumps(valid_users))
         enqueue(chat_id, 'send_message', text="Админ, проведите розыгрыш самостоятельно.")
-    # Размут всех замьюченных (дисквалифицированных и забаненных)
+    # Размут всех замьюченных
     for uid in session.muted_users:
         await unmute_user(bot, chat_id, uid)
     active_sessions.pop(chat_id, None)
@@ -602,7 +605,7 @@ async def filter_msg(message: types.Message, bot: Bot):
         mention = f"@{username}" if username else message.from_user.full_name
         enqueue(message.chat.id, 'send_message', text=f"🚫 {mention}, вы забанены.")
 
-# ---------- Меню настроек ----------
+# ---------- Меню настроек (полный FSM) ----------
 class SettingsForm(StatesGroup):
     waiting_for_chat_id = State()
     waiting_for_duration = State()
@@ -666,7 +669,7 @@ async def view_settings(call: types.CallbackQuery):
     await call.message.edit_text(s, reply_markup=back_btn(), parse_mode='HTML')
     await call.answer()
 
-# ---------- Обработчики настроек (каждый с FSM) ----------
+# Обработчики для каждой настройки (чат, длительность, триггер, призы, правила, старт, стоп, результат, каналы, баны, макс участников)
 @admin_router.callback_query(F.data == "set_chat")
 async def set_chat_start(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text("Введите ID чата (текущий: " +
