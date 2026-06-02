@@ -208,6 +208,7 @@ class RouletteSession:
         self.roulette_id = roulette_id
         self.trigger = trigger.lower().strip()
         self.participants: Dict[int, dict] = {}  # user_id -> данные
+        self.muted_users: set = set()  # user_id, кого замьютили за нарушения
 
     def process_message(self, user_id: int, username: Optional[str], message_id: int, text: str) -> Tuple[str, Optional[int], bool]:
         """Возвращает (action, trigger_msg_id_to_delete, need_sub_warning)."""
@@ -243,7 +244,7 @@ class RouletteSession:
                 rec['username'] = username
                 return 'valid', None, True
             else:
-                # Без username, но запись сохраняется (valid=False)
+                # Без username, запись сохраняется (valid=False)
                 return 'no_username', None, False
         else:
             rec['non_trigger_count'] += 1
@@ -255,9 +256,8 @@ class RouletteSession:
 
     async def finalize(self, bot: Bot) -> List[int]:
         """Возвращает финальный список user_id по порядку сообщений, удаляя триггеры исключённых."""
-        # Все, кто отправил триггер (имеет has_trigger)
+        # Собираем всех, кто отправил триггер
         candidates = {uid: rec for uid, rec in self.participants.items() if rec.get('has_trigger')}
-        # Сортируем по message_id
         sorted_uids = sorted(candidates.keys(), key=lambda uid: candidates[uid]['trigger_msg_id'])
         final = []
         for uid in sorted_uids:
@@ -270,32 +270,19 @@ class RouletteSession:
                 try:
                     member = await bot.get_chat_member(self.chat_id, uid)
                     username = member.user.username
-                    rec['username'] = username  # обновляем на будущее
+                    rec['username'] = username
                 except:
                     pass
-            if not username:
-                # Удаляем триггер
+            if not username or not await check_subscriptions(bot, uid) or is_user_banned(uid, username):
+                # Удаляем триггер и запись из участников
                 if rec.get('trigger_msg_id'):
                     try:
                         await bot.delete_message(self.chat_id, rec['trigger_msg_id'])
                     except:
                         pass
-                continue
-            # Проверяем подписки
-            if not await check_subscriptions(bot, uid):
-                if rec.get('trigger_msg_id'):
-                    try:
-                        await bot.delete_message(self.chat_id, rec['trigger_msg_id'])
-                    except:
-                        pass
-                continue
-            # Проверяем бан
-            if is_user_banned(uid, username):
-                if rec.get('trigger_msg_id'):
-                    try:
-                        await bot.delete_message(self.chat_id, rec['trigger_msg_id'])
-                    except:
-                        pass
+                # Удаляем из participants, чтобы не мешался
+                if uid in self.participants:
+                    del self.participants[uid]
                 continue
             final.append(uid)
         return final
@@ -474,7 +461,12 @@ async def reroll_cmd(message: types.Message, bot: Bot):
     result = last['result_msg'].replace('{winners}', "\n".join(wstr))
     if old_names:
         result += "\n\nЗачёркнутые лишились призов: " + ", ".join(f"<s>{n}</s>" for n in old_names)
-    await bot.send_photo(chat_id, photo=img_file, caption=result)
+    if len(result) > 1024:
+        result = result[:1000] + "\n...\n(полный список ниже)"
+        await bot.send_photo(chat_id, photo=img_file, caption=result)
+        await bot.send_message(chat_id, "\n".join(wstr))  # отправим полный список отдельным сообщением
+    else:
+        await bot.send_photo(chat_id, photo=img_file, caption=result)
     enqueue(chat_id, 'send_message', text=f"🔒 Хеш: {seed_hash}\nSeed: {seed}")
     enqueue(chat_id, 'send_message', text=get_verification_instruction(last['id'], seed, names, [str(num) for num in winner_numbers]))
     new_id = save_roulette(chat_id, 'finished', last['duration'], len(final_winners),
@@ -513,41 +505,55 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
         await send_template(bot, chat_id, stop)
     valid_users = await session.finalize(bot)
     # valid_users уже отсортированы по message_id внутри finalize
-    names = []
+    # Формируем список с @ для ЛС и без @ для чата
+    names_with_at = []
+    names_clean = []
     for uid in valid_users:
         try:
             m = await bot.get_chat_member(chat_id, uid)
-            names.append(m.user.username)
+            username = m.user.username
+            names_clean.append(username)
+            names_with_at.append(f"@{username}" if username else m.user.full_name)
         except:
-            names.append(str(uid))
-    participants_str = "\n".join(f"{i+1}. {n}" for i, n in enumerate(names))
-    enqueue(chat_id, 'send_message', text=f"📋 Участники ({len(valid_users)}):\n{participants_str}")
+            names_clean.append(str(uid))
+            names_with_at.append(str(uid))
+    participants_str_clean = "\n".join(f"{i+1}. {n}" for i, n in enumerate(names_clean))
+    enqueue(chat_id, 'send_message', text=f"📋 Участники ({len(valid_users)}):\n{participants_str_clean}")
+    # Админу с @
+    participants_str_with_at = "\n".join(f"{i+1}. {n}" for i, n in enumerate(names_with_at))
     try:
-        await bot.send_message(MAIN_ADMIN_ID, f"Список участников чата {chat_id}:\n{participants_str}")
+        await bot.send_message(MAIN_ADMIN_ID, f"Список участников чата {chat_id}:\n{participants_str_with_at}")
     except:
         pass
     if roulette['winners_count'] > 0:
         seed = roulette['seed']
         winners = select_winners(valid_users, roulette['winners_count'], seed)
         winner_numbers = [valid_users.index(u)+1 for u in winners]
-        wnames = [names[valid_users.index(u)] for u in winners]
+        wnames_clean = [names_clean[valid_users.index(u)] for u in winners]
+        wnames_with_at = [names_with_at[valid_users.index(u)] for u in winners]
         img_bytes = create_result_image(winner_numbers, len(valid_users), datetime.now(NOVOSIBIRSK), roulette['seed_hash'])
         img_file = BufferedInputFile(img_bytes.read(), filename="result.png")
         prizes = json.loads(roulette['prizes']) if roulette['prizes'] else []
+        # Текст для подписи с призами
         wstr = [f"{num}. {name} (приз: {prizes[i] if i < len(prizes) else 'не указан'})"
-                for i, (num, name) in enumerate(zip(winner_numbers, wnames))]
+                for i, (num, name) in enumerate(zip(winner_numbers, wnames_clean))]
         result_text = roulette['result_msg'].replace('{winners}', "\n".join(wstr))
-        await bot.send_photo(chat_id, photo=img_file, caption=result_text)
+        if len(result_text) > 1024:
+            result_text = result_text[:1000] + "\n...\n(полный список ниже)"
+            await bot.send_photo(chat_id, photo=img_file, caption=result_text)
+            await bot.send_message(chat_id, "\n".join(wstr))
+        else:
+            await bot.send_photo(chat_id, photo=img_file, caption=result_text)
         enqueue(chat_id, 'send_message', text=f"🔒 Хеш: {roulette['seed_hash']}\nSeed: {seed}")
-        enqueue(chat_id, 'send_message', text=get_verification_instruction(rid, seed, names, [str(num) for num in winner_numbers]))
+        enqueue(chat_id, 'send_message', text=get_verification_instruction(rid, seed, names_clean, [str(num) for num in winner_numbers]))
         update_roulette(rid, status='finished', participants_json=json.dumps(valid_users),
                         winners_json=json.dumps([valid_users.index(u) for u in winners]))
     else:
         update_roulette(rid, status='finished', participants_json=json.dumps(valid_users))
         enqueue(chat_id, 'send_message', text="Админ, проведите розыгрыш самостоятельно.")
-    for uid, rec in session.participants.items():
-        if rec.get('disqualified'):
-            await unmute_user(bot, chat_id, uid)
+    # Размут всех замьюченных (дисквалифицированных и забаненных)
+    for uid in session.muted_users:
+        await unmute_user(bot, chat_id, uid)
     active_sessions.pop(chat_id, None)
 
 # ---------- Фильтр сообщений участников ----------
@@ -582,6 +588,7 @@ async def filter_msg(message: types.Message, bot: Bot):
             except:
                 pass
         await mute_user(bot, message.chat.id, user_id)
+        session.muted_users.add(user_id)
         mention = f"@{username}" if username else message.from_user.full_name
         enqueue(message.chat.id, 'send_message', text=f"⛔ {mention} дисквалифицирован.")
     elif action == 'extra_ignored':
@@ -591,6 +598,7 @@ async def filter_msg(message: types.Message, bot: Bot):
     elif action == 'banned':
         await message.delete()
         await mute_user(bot, message.chat.id, user_id)
+        session.muted_users.add(user_id)
         mention = f"@{username}" if username else message.from_user.full_name
         enqueue(message.chat.id, 'send_message', text=f"🚫 {mention}, вы забанены.")
 
