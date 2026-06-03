@@ -11,7 +11,8 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.types import ChatPermissions, BufferedInputFile, MessageEntity
+from aiogram.types import ChatPermissions, BufferedInputFile, MessageEntity, InputMediaPhoto
+from aiogram.exceptions import TelegramBadRequest
 
 from database import (
     get_setting, set_setting, get_channels, add_channel, remove_channel,
@@ -40,6 +41,8 @@ async def queue_worker(bot: Bot):
                 await bot.send_message(chat_id, **kwargs)
             elif method == 'send_photo':
                 await bot.send_photo(chat_id, **kwargs)
+            elif method == 'send_media_group':
+                await bot.send_media_group(chat_id, **kwargs)
         except Exception as e:
             logger.error(f"Queue error: {e}")
         await asyncio.sleep(2)
@@ -112,7 +115,6 @@ async def send_template(bot: Bot, chat_id: int, template_str: str, **substitutio
                 media_type = data['media_type']
                 file_id = data['file_id']
                 caption = substitute(data.get('caption', ''), **substitutions)
-                # Обрезаем caption до 1024 символов, если длиннее
                 if len(caption) > 1024:
                     caption = caption[:1020] + "..."
                 if media_type == 'photo':
@@ -352,7 +354,7 @@ async def random_cmd(message: types.Message, bot: Bot):
     enqueue(chat_id, 'send_message', text=f"🔒 Хеш: {seed_hash}\nSeed: {seed}")
     enqueue(chat_id, 'send_message', text=get_verification_instruction(0, seed, [str(n) for n in numbers], [str(w) for w in winners]))
 
-# ---------- @перекрут ----------
+# ---------- @перекрут (исправлен) ----------
 @admin_router.message(F.text.regexp(r'@перекрут\s+(.+)'))
 async def reroll_cmd(message: types.Message, bot: Bot):
     if not await is_admin(bot, message.chat.id, message.from_user.id):
@@ -388,6 +390,7 @@ async def reroll_cmd(message: types.Message, bot: Bot):
             old_names.append(f"@{m.user.username}" if m.user.username else m.user.full_name)
         except:
             old_names.append(str(participants[old_idx]))
+    # Имена для участников (с @)
     names = []
     for uid in participants:
         try:
@@ -395,21 +398,61 @@ async def reroll_cmd(message: types.Message, bot: Bot):
             names.append(f"@{m.user.username}" if m.user.username else m.user.full_name)
         except:
             names.append(str(uid))
-    winner_numbers = [i+1 for i in final_winners]
-    img_bytes = create_result_image(winner_numbers, len(participants), datetime.now(NOVOSIBIRSK), seed_hash)
-    img_file = BufferedInputFile(img_bytes.read(), filename="reroll.png")
+    winner_numbers_old = [i+1 for i in winners_idx]  # старые номера
+    winner_numbers_new = [i+1 for i in final_winners]  # новые номера
+    # Картинка старого результата
+    img_bytes_old = create_result_image(winner_numbers_old, len(participants), parse_datetime(last['stop_time']), last['seed_hash'])
+    img_file_old = BufferedInputFile(img_bytes_old.read(), filename="old_result.png")
+    # Картинка нового результата
+    img_bytes_new = create_result_image(winner_numbers_new, len(participants), datetime.now(NOVOSIBIRSK), seed_hash)
+    img_file_new = BufferedInputFile(img_bytes_new.read(), filename="new_result.png")
+    # Формируем подпись с новыми победителями (@ и приз в скобках)
     prizes_list = json.loads(last['prizes']) if last['prizes'] else []
-    # Формируем строку с победителями для подстановки
-    wstr = "\n".join(f"{num}. {names[i]} (приз: {prizes_list[i] if i < len(prizes_list) else 'не указан'})"
-                     for i, num in enumerate(winner_numbers))
-    # Используем send_template с шаблоном result_msg (подстановка {winners})
-    # ВНИМАНИЕ: если шаблон – это строка JSON, send_template распарсит и подставит корректно
-    await send_template(bot, chat_id, last['result_msg'], winners=wstr)
+    new_winners_str = []
+    for i, idx in enumerate(final_winners):
+        name = names[idx] if idx < len(names) else str(participants[idx])
+        prize = prizes_list[i] if i < len(prizes_list) else "не указан"
+        new_winners_str.append(f"{i+1}. {name} ({prize})")
+    caption_text = "\n".join(new_winners_str)
+    # Добавляем зачёркнутых, если есть
     if old_names:
         crossed = ", ".join(f"<s>{n}</s>" for n in old_names)
-        enqueue(chat_id, 'send_message', text=f"Зачёркнутые лишились призов: {crossed}")
+        caption_text += f"\n\nЛишились призов: {crossed}"
+    # Используем шаблон result_msg, если он текстовый
+    result_template = last['result_msg']
+    try:
+        tmpl = json.loads(result_template)
+        if isinstance(tmpl, dict) and tmpl.get('type') == 'text':
+            base_text = tmpl['text']
+            full_caption = base_text.replace('{winners}', caption_text)
+            entities = [MessageEntity(**e) for e in tmpl.get('entities', [])] if tmpl.get('entities') else None
+            if len(full_caption) > 1024:
+                full_caption = full_caption[:1020] + "..."
+            # Отправляем альбом из двух фото с подписью
+            media = [
+                InputMediaPhoto(media=img_file_old, caption=full_caption, caption_entities=entities),
+                InputMediaPhoto(media=img_file_new)
+            ]
+        else:
+            # Если шаблон не текстовый, используем простую подпись
+            full_caption = caption_text
+            if len(full_caption) > 1024:
+                full_caption = full_caption[:1020] + "..."
+            media = [
+                InputMediaPhoto(media=img_file_old, caption=full_caption),
+                InputMediaPhoto(media=img_file_new)
+            ]
+    except:
+        full_caption = caption_text
+        if len(full_caption) > 1024:
+            full_caption = full_caption[:1020] + "..."
+        media = [
+            InputMediaPhoto(media=img_file_old, caption=full_caption),
+            InputMediaPhoto(media=img_file_new)
+        ]
+    await bot.send_media_group(chat_id, media=media)
     enqueue(chat_id, 'send_message', text=f"🔒 Хеш: {seed_hash}\nSeed: {seed}")
-    enqueue(chat_id, 'send_message', text=get_verification_instruction(last['id'], seed, names, [str(num) for num in winner_numbers]))
+    enqueue(chat_id, 'send_message', text=get_verification_instruction(last['id'], seed, names, [str(num) for num in winner_numbers_new]))
     new_id = save_roulette(chat_id, 'finished', last['duration'], len(final_winners),
                            last['trigger'], last['prizes'], last['rules'], last['start_msg'],
                            last['stop_msg'], last['result_msg'], datetime.now(NOVOSIBIRSK),
@@ -480,28 +523,25 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
         winners = select_winners(valid_users, roulette['winners_count'], seed)
         winner_numbers = [valid_users.index(u)+1 for u in winners]
         wnames_clean = [names_clean[valid_users.index(u)] for u in winners]
+        wnames_with_at = [names_with_at[valid_users.index(u)] for u in winners]
         img_bytes = create_result_image(winner_numbers, len(valid_users), datetime.now(NOVOSIBIRSK), roulette['seed_hash'])
         img_file = BufferedInputFile(img_bytes.read(), filename="result.png")
         prizes = json.loads(roulette['prizes']) if roulette['prizes'] else []
-        wstr = "\n".join(f"{num}. {name} (приз: {prizes[i] if i < len(prizes) else 'не указан'})"
-                         for i, (num, name) in enumerate(zip(winner_numbers, wnames_clean)))
-        # Отправляем картинку с подписью, используя send_template для результата
-        # send_template сама отправит или текст, или медиа в зависимости от шаблона.
-        # Но в случае картинки нам нужно прикрепить img_file. Поэтому используем send_photo напрямую,
-        # а caption формируем через substitute с шаблоном result_msg.
+        # Формируем список с @ и призами в скобках
+        wstr = "\n".join(f"{num}. {name} ({prizes[i] if i < len(prizes) else 'не указан'})"
+                         for i, (num, name) in enumerate(zip(winner_numbers, wnames_with_at)))
+        # Подпись из шаблона
         result_template = roulette['result_msg']
-        # Попытаемся распарсить как JSON, чтобы применить форматирование
         try:
-            template_data = json.loads(result_template)
-            if isinstance(template_data, dict) and template_data.get('type') == 'text':
-                caption_text = substitute(template_data['text'], winners=wstr)
-                entities = [MessageEntity(**e) for e in template_data.get('entities', [])] if template_data.get('entities') else None
+            tmpl_data = json.loads(result_template)
+            if isinstance(tmpl_data, dict) and tmpl_data.get('type') == 'text':
+                caption_text = substitute(tmpl_data['text'], winners=wstr)
+                entities = [MessageEntity(**e) for e in tmpl_data.get('entities', [])] if tmpl_data.get('entities') else None
                 if len(caption_text) > 1024:
                     caption_text = caption_text[:1020] + "..."
                 await bot.send_photo(chat_id, photo=img_file, caption=caption_text, caption_entities=entities)
             else:
-                # Для других типов (медиа) используем send_template с заменой, но тогда картинка не прикрепится.
-                # Поэтому для простоты: если шаблон не текстовый, отправляем просто текст результата.
+                # Для других типов отправляем просто текст
                 caption_text = substitute(str(result_template), winners=wstr)
                 if len(caption_text) > 1024:
                     caption_text = caption_text[:1020] + "..."
