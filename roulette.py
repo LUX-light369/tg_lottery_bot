@@ -100,6 +100,7 @@ def substitute(template: str, **kwargs) -> str:
     return template
 
 async def send_template(bot: Bot, chat_id: int, template_str: str, **substitutions) -> types.Message:
+    """Отправляет шаблон с поддержкой текста, форматирования и медиа."""
     try:
         data = json.loads(template_str)
         if isinstance(data, dict):
@@ -111,6 +112,9 @@ async def send_template(bot: Bot, chat_id: int, template_str: str, **substitutio
                 media_type = data['media_type']
                 file_id = data['file_id']
                 caption = substitute(data.get('caption', ''), **substitutions)
+                # Обрезаем caption до 1024 символов, если длиннее
+                if len(caption) > 1024:
+                    caption = caption[:1020] + "..."
                 if media_type == 'photo':
                     return await bot.send_photo(chat_id, photo=file_id, caption=caption)
                 elif media_type == 'video':
@@ -130,6 +134,7 @@ async def send_template(bot: Bot, chat_id: int, template_str: str, **substitutio
                 return await bot.send_message(chat_id, text, entities=entities)
     except:
         pass
+    # Обычный текст
     text = substitute(template_str, **substitutions)
     return await bot.send_message(chat_id, text)
 
@@ -216,7 +221,6 @@ class RouletteSession:
             rec = candidates[uid]
             if rec['disqualified']:
                 continue
-            # Всегда проверяем актуальный username
             username = None
             try:
                 member = await bot.get_chat_member(self.chat_id, uid)
@@ -296,7 +300,7 @@ async def roulette_cmd(message: types.Message, bot: Bot):
     else:
         await start_recording(bot, chat_id, rid)
 
-# ---------- @отмена ----------
+# ---------- @отмена (без удаления триггеров) ----------
 @admin_router.message(F.text.regexp(r'@отмена'))
 async def cancel_cmd(message: types.Message, bot: Bot):
     if not await is_admin(bot, message.chat.id, message.from_user.id):
@@ -304,12 +308,6 @@ async def cancel_cmd(message: types.Message, bot: Bot):
     chat_id = message.chat.id
     session = active_sessions.pop(chat_id, None)
     if session:
-        for uid, rec in session.participants.items():
-            if rec.get('trigger_msg_id'):
-                try:
-                    await bot.delete_message(chat_id, rec['trigger_msg_id'])
-                except:
-                    pass
         enqueue(chat_id, 'send_message', text="❌ Рулетка отменена.")
         update_roulette(session.roulette_id, status='cancelled')
     else:
@@ -401,16 +399,15 @@ async def reroll_cmd(message: types.Message, bot: Bot):
     img_bytes = create_result_image(winner_numbers, len(participants), datetime.now(NOVOSIBIRSK), seed_hash)
     img_file = BufferedInputFile(img_bytes.read(), filename="reroll.png")
     prizes_list = json.loads(last['prizes']) if last['prizes'] else []
-    wstr = [f"{num}. {names[i]} (приз: {prizes_list[i] if i < len(prizes_list) else 'не указан'})"
-            for i, num in enumerate(winner_numbers)]
-    result = last['result_msg'].replace('{winners}', "\n".join(wstr))
+    # Формируем строку с победителями для подстановки
+    wstr = "\n".join(f"{num}. {names[i]} (приз: {prizes_list[i] if i < len(prizes_list) else 'не указан'})"
+                     for i, num in enumerate(winner_numbers))
+    # Используем send_template с шаблоном result_msg (подстановка {winners})
+    # ВНИМАНИЕ: если шаблон – это строка JSON, send_template распарсит и подставит корректно
+    await send_template(bot, chat_id, last['result_msg'], winners=wstr)
     if old_names:
-        result += "\n\nЗачёркнутые лишились призов: " + ", ".join(f"<s>{n}</s>" for n in old_names)
-    if len(result) > 1024:
-        await bot.send_photo(chat_id, photo=img_file, caption=result[:1020] + "...")
-        await bot.send_message(chat_id, "\n".join(wstr))
-    else:
-        await bot.send_photo(chat_id, photo=img_file, caption=result)
+        crossed = ", ".join(f"<s>{n}</s>" for n in old_names)
+        enqueue(chat_id, 'send_message', text=f"Зачёркнутые лишились призов: {crossed}")
     enqueue(chat_id, 'send_message', text=f"🔒 Хеш: {seed_hash}\nSeed: {seed}")
     enqueue(chat_id, 'send_message', text=get_verification_instruction(last['id'], seed, names, [str(num) for num in winner_numbers]))
     new_id = save_roulette(chat_id, 'finished', last['duration'], len(final_winners),
@@ -454,7 +451,6 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
         await send_template(bot, chat_id, stop)
         await asyncio.sleep(2)
     valid_users = await session.finalize(bot)
-    # Имена: без @ для чата, с @ для админа
     names_clean = []
     names_with_at = []
     for uid in valid_users:
@@ -487,14 +483,35 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
         img_bytes = create_result_image(winner_numbers, len(valid_users), datetime.now(NOVOSIBIRSK), roulette['seed_hash'])
         img_file = BufferedInputFile(img_bytes.read(), filename="result.png")
         prizes = json.loads(roulette['prizes']) if roulette['prizes'] else []
-        wstr = [f"{num}. {name} (приз: {prizes[i] if i < len(prizes) else 'не указан'})"
-                for i, (num, name) in enumerate(zip(winner_numbers, wnames_clean))]
-        result_text = roulette['result_msg'].replace('{winners}', "\n".join(wstr))
-        if len(result_text) > 1024:
-            await bot.send_photo(chat_id, photo=img_file, caption=result_text[:1020] + "...")
-            await bot.send_message(chat_id, "\n".join(wstr))
-        else:
-            await bot.send_photo(chat_id, photo=img_file, caption=result_text)
+        wstr = "\n".join(f"{num}. {name} (приз: {prizes[i] if i < len(prizes) else 'не указан'})"
+                         for i, (num, name) in enumerate(zip(winner_numbers, wnames_clean)))
+        # Отправляем картинку с подписью, используя send_template для результата
+        # send_template сама отправит или текст, или медиа в зависимости от шаблона.
+        # Но в случае картинки нам нужно прикрепить img_file. Поэтому используем send_photo напрямую,
+        # а caption формируем через substitute с шаблоном result_msg.
+        result_template = roulette['result_msg']
+        # Попытаемся распарсить как JSON, чтобы применить форматирование
+        try:
+            template_data = json.loads(result_template)
+            if isinstance(template_data, dict) and template_data.get('type') == 'text':
+                caption_text = substitute(template_data['text'], winners=wstr)
+                entities = [MessageEntity(**e) for e in template_data.get('entities', [])] if template_data.get('entities') else None
+                if len(caption_text) > 1024:
+                    caption_text = caption_text[:1020] + "..."
+                await bot.send_photo(chat_id, photo=img_file, caption=caption_text, caption_entities=entities)
+            else:
+                # Для других типов (медиа) используем send_template с заменой, но тогда картинка не прикрепится.
+                # Поэтому для простоты: если шаблон не текстовый, отправляем просто текст результата.
+                caption_text = substitute(str(result_template), winners=wstr)
+                if len(caption_text) > 1024:
+                    caption_text = caption_text[:1020] + "..."
+                await bot.send_photo(chat_id, photo=img_file, caption=caption_text)
+        except:
+            caption_text = substitute(str(result_template), winners=wstr)
+            if len(caption_text) > 1024:
+                caption_text = caption_text[:1020] + "..."
+            await bot.send_photo(chat_id, photo=img_file, caption=caption_text)
+
         enqueue(chat_id, 'send_message', text=f"🔒 Хеш: {roulette['seed_hash']}\nSeed: {seed}")
         enqueue(chat_id, 'send_message', text=get_verification_instruction(rid, seed, names_clean, [str(num) for num in winner_numbers]))
         update_roulette(rid, status='finished', participants_json=json.dumps(valid_users),
@@ -502,7 +519,6 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     else:
         update_roulette(rid, status='finished', participants_json=json.dumps(valid_users))
         enqueue(chat_id, 'send_message', text="Админ, проведите розыгрыш самостоятельно.")
-    # Размут всех замьюченных
     for uid in session.muted_users:
         await unmute_user(bot, chat_id, uid)
     active_sessions.pop(chat_id, None)
