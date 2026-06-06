@@ -32,7 +32,11 @@ message_queue = asyncio.Queue()
 logger = logging.getLogger(__name__)
 
 MAIN_ADMIN_ID = None
-BOT_USERNAME = None  # будет установлен при старте
+BOT_USERNAME = None  # будет установлена из main.py
+
+def set_bot_username(username: str):
+    global BOT_USERNAME
+    BOT_USERNAME = username
 
 # ---------- Очередь сообщений ----------
 async def queue_worker(bot: Bot):
@@ -139,7 +143,7 @@ async def send_template(bot: Bot, chat_id: int, template_str: str, **substitutio
     return await bot.send_message(chat_id, text, parse_mode='HTML')
 
 def save_media_template(message: types.Message) -> str:
-    """Сохраняет шаблон: медиа/пересылка/текст с HTML-форматированием"""
+    """Сохраняет шаблон: медиа/пересылка/HTML-текст"""
     if message.forward_from_chat and message.forward_from_message_id:
         return json.dumps({'type': 'forward', 'chat_id': message.forward_from_chat.id,
                            'message_id': message.forward_from_message_id})
@@ -156,10 +160,9 @@ def save_media_template(message: types.Message) -> str:
     if message.document:
         return json.dumps({'type': 'media', 'media_type': 'document', 'file_id': message.document.file_id,
                            'caption': message.caption or ''})
-    # Текст с HTML (если есть entities, преобразуем в HTML? Но будем хранить как HTML, 
-    # но т.к. aiogram дает text без форматирования, мы используем html_text)
+    # Текст с HTML (aiogram автоматически преобразует entities в html_text)
     if message.text:
-        return message.html_text  # aiogram автоматически преобразует entities в HTML
+        return message.html_text
     return message.text or ''
 
 def format_setting(value: str) -> str:
@@ -248,88 +251,26 @@ class RouletteSession:
 
 active_sessions: Dict[int, RouletteSession] = {}
 
-# ---------- Роутеры ----------
+# ---------- Роутер (теперь только админский, без verify_router) ----------
 admin_router = Router()
-verify_router = Router()
 filter_router = Router()
 
-# ---------- /start (меню админа, deep-link для проверки) ----------
-@verify_router.message(Command('start'))
-async def start_deep(message: types.Message, bot: Bot, command: CommandObject = None):
+# ---------- /start (меню админа + deep-link проверка) ----------
+@admin_router.message(Command('start'))
+async def start_cmd(message: types.Message, bot: Bot, command: CommandObject = None):
     if message.chat.type != 'private':
         return
-    # Если главный админ, показываем меню (не обрабатываем deep-link)
+    # Если главный админ – показываем меню (игнорируем deep-link)
     if message.from_user.id == MAIN_ADMIN_ID:
-        return  # пропускаем, чтобы admin_router обработал
-    # Проверяем deep-link параметр
+        await menu(message)
+        return
+    # Для обычных пользователей: если есть токен – проверка
     if command and command.args:
         token = command.args.strip()
         if token:
             await handle_verify_token(message, bot, token)
             return
-    # Обычный /start для обычного пользователя
     await message.answer("ℹ️ Я бот для честных рулеток. Для проверки используйте ссылку из результатов розыгрыша.")
-
-# ---------- /verify ----------
-@verify_router.message(Command('verify'))
-async def verify_cmd(message: types.Message, state: FSMContext):
-    if message.chat.type != 'private':
-        return
-    await message.answer("Пожалуйста, отправьте код проверки (токен) из результатов розыгрыша.")
-    await state.set_state('waiting_verify_token')
-
-@verify_router.message(StateFilter('waiting_verify_token'))
-async def process_verify_token(message: types.Message, state: FSMContext):
-    token = message.text.strip()
-    await handle_verify_token(message, message.bot, token)
-    await state.clear()
-
-async def handle_verify_token(message: types.Message, bot: Bot, token: str):
-    roulette = get_roulette_by_token(token)
-    if not roulette:
-        await message.answer("❌ Недействительный или устаревший токен проверки.")
-        return
-    # Подготовка отчета
-    participants = json.loads(roulette['participants_json']) if roulette['participants_json'] else []
-    winners_idx = json.loads(roulette['winners_json']) if roulette['winners_json'] else []
-    # Формируем имена
-    names = []
-    for uid in participants:
-        try:
-            m = await bot.get_chat_member(roulette['chat_id'], uid)
-            names.append(f"@{m.user.username}" if m.user.username else m.user.full_name)
-        except:
-            names.append(str(uid))
-    winners_names = [names[idx] for idx in winners_idx] if winners_idx else []
-    seed = roulette.get('seed', 'не указан')
-    seed_hash = roulette.get('seed_hash', 'не указан')
-    start_time = parse_datetime(roulette['start_time']).strftime('%d.%m.%Y %H:%M') if roulette['start_time'] else '?'
-    # Текст отчёта
-    report = (
-        "🔍 <b>Проверка честности розыгрыша</b>\n\n"
-        f"📅 Дата: {start_time}\n"
-        f"👥 Участников: {len(participants)}\n"
-        f"🎲 Победители: {', '.join(winners_names) if winners_names else 'нет'}\n\n"
-        f"🔒 <b>Seed (секретное число):</b> <code>{seed}</code>\n"
-        f"📝 <b>Хеш SHA256:</b> <code>{seed_hash}</code>\n\n"
-    )
-    report += (
-        "ℹ️ <b>Как проверить:</b>\n"
-        "1. Убедитесь, что хеш совпадает с объявленным до начала розыгрыша.\n"
-        "2. Перейдите на сайт https://emn178.github.io/online-tools/sha256.html и введите seed — получите хеш. Сравните.\n"
-        "3. Скачайте HTML-страницу для офлайн-проверки (доступна по ссылке в инструкции).\n"
-        "4. Также можно выполнить код Python (пример ниже).\n\n"
-        "<b>Код для проверки (Python):</b>\n"
-        "<code>import random\n"
-        "seed = '...'\n"
-        "participants = [...]\n"
-        "rng = random.Random(seed)\n"
-        "indices = list(range(len(participants)))\n"
-        "rng.shuffle(indices)\n"
-        "winners = [participants[i] for i in indices[:кол-во]]</code>\n\n"
-        "Если результат совпал — розыгрыш честный."
-    )
-    await message.answer(report, parse_mode='HTML')
 
 # ---------- @рулетка ----------
 @admin_router.message(F.text.regexp(r'@рулетка\s+(.+)'))
@@ -369,7 +310,6 @@ async def roulette_cmd(message: types.Message, bot: Bot):
                         get_setting('start_msg'), get_setting('stop_msg'),
                         get_setting('result_msg'), start_time, stop_time,
                         seed=seed, seed_hash=seed_hash, verify_token=verify_token)
-    # Анонс с призами
     announce = (
         f"📢 <b>Рулетка</b>\n"
         f"Победителей: {winners if winners else 'определит админ'}\n"
@@ -380,7 +320,6 @@ async def roulette_cmd(message: types.Message, bot: Bot):
     if prizes_list:
         announce += "\n<b>Призы:</b>\n" + "\n".join(f"• {p}" for p in prizes_list)
     enqueue(chat_id, 'send_message', text=announce, parse_mode='HTML')
-    # Правила (задержка 2 сек обеспечивается очередью)
     rules = get_setting('rules')
     if rules:
         enqueue(chat_id, 'send_message', text=substitute(rules, trigger=trigger, duration=str(duration)), parse_mode='HTML')
@@ -441,11 +380,10 @@ async def random_cmd(message: types.Message, bot: Bot):
     await bot.send_photo(chat_id, photo=img_file)
     verify_link = f"https://t.me/{BOT_USERNAME}?start={verify_token}"
     enqueue(chat_id, 'send_message', text=f"🔒 Хеш: <code>{seed_hash}</code>\nSeed: <code>{seed}</code>\n🔍 Проверка: {verify_link}", parse_mode='HTML', disable_web_page_preview=True)
-    # Сохраняем в БД с winners, participants и verify_token
-    rid = save_roulette(chat_id, 'finished', 0, winners_count,
-                        '', '', '', '', '', '', datetime.now(NOVOSIBIRSK), datetime.now(NOVOSIBIRSK),
-                        seed=seed, seed_hash=seed_hash, verify_token=verify_token,
-                        participants_json=json.dumps(numbers), winners_json=json.dumps([numbers.index(w) for w in winners]))
+    save_roulette(chat_id, 'finished', 0, winners_count,
+                  '', '', '', '', '', '', datetime.now(NOVOSIBIRSK), datetime.now(NOVOSIBIRSK),
+                  seed=seed, seed_hash=seed_hash, verify_token=verify_token,
+                  participants_json=json.dumps(numbers), winners_json=json.dumps([numbers.index(w) for w in winners]))
 
 # ---------- @перекрут ----------
 @admin_router.message(F.text.regexp(r'@перекрут\s+(.+)'))
@@ -484,7 +422,6 @@ async def reroll_cmd(message: types.Message, bot: Bot):
             old_names.append(f"@{m.user.username}" if m.user.username else m.user.full_name)
         except:
             old_names.append(str(participants[old_idx]))
-    # Имена с @
     names = []
     for uid in participants:
         try:
@@ -509,10 +446,17 @@ async def reroll_cmd(message: types.Message, bot: Bot):
     if old_names:
         crossed = ", ".join(f"<s>{n}</s>" for n in old_names)
         caption_text += f"\n\nЛишились призов: {crossed}"
-    # Подставляем в шаблон результата
+    # Используем шаблон результата (если текстовый) с подстановкой
     result_template = last['result_msg']
-    # Простой текст с HTML
-    full_caption = result_template.replace('{winners}', caption_text)
+    try:
+        tmpl_data = json.loads(result_template)
+        if isinstance(tmpl_data, dict) and tmpl_data.get('type') == 'text':
+            base_text = tmpl_data['text']
+            full_caption = base_text.replace('{winners}', caption_text)
+        else:
+            full_caption = caption_text
+    except:
+        full_caption = result_template.replace('{winners}', caption_text)
     if len(full_caption) > 1024:
         full_caption = full_caption[:1020] + "..."
     media = [
@@ -538,7 +482,6 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     roulette = get_roulette_by_id(rid)
     if not roulette or roulette['status'] != 'waiting_start':
         return
-    # Правила уже были отправлены после анонса, не повторяем
     start = roulette['start_msg']
     if start:
         await send_template(bot, chat_id, start, trigger=roulette['trigger'])
@@ -588,14 +531,21 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
         img_file = BufferedInputFile(img_bytes.read(), filename="result.png")
         prizes_raw = roulette['prizes'] or ''
         prizes_list = [p.strip() for p in prizes_raw.split('\n') if p.strip()] if prizes_raw else []
-        # Победители без номеров
         winners_lines = []
         for i, name in enumerate(wnames_with_at):
             prize = prizes_list[i] if i < len(prizes_list) else "не указан"
             winners_lines.append(f"{name} ({prize})")
         wstr = "\n".join(winners_lines)
         result_template = roulette['result_msg']
-        full_caption = result_template.replace('{winners}', wstr)
+        try:
+            tmpl_data = json.loads(result_template)
+            if isinstance(tmpl_data, dict) and tmpl_data.get('type') == 'text':
+                base_text = tmpl_data['text']
+                full_caption = base_text.replace('{winners}', wstr)
+            else:
+                full_caption = result_template.replace('{winners}', wstr)
+        except:
+            full_caption = result_template.replace('{winners}', wstr)
         if len(full_caption) > 1024:
             full_caption = full_caption[:1020] + "..."
         await bot.send_photo(chat_id, photo=img_file, caption=full_caption, parse_mode='HTML')
@@ -656,7 +606,7 @@ async def filter_msg(message: types.Message, bot: Bot):
         mention = f"@{username}" if username else message.from_user.full_name
         enqueue(message.chat.id, 'send_message', text=f"🚫 {mention}, вы забанены.")
 
-# ---------- Меню настроек (без изменений в логике, только призы вводятся с новой строки) ----------
+# ---------- Меню настроек ----------
 class SettingsForm(StatesGroup):
     waiting_for_chat_id = State()
     waiting_for_duration = State()
@@ -722,7 +672,7 @@ async def view_settings(call: types.CallbackQuery):
     await call.message.edit_text(s, reply_markup=back_btn(), parse_mode='HTML')
     await call.answer()
 
-# Обработчики настроек (аналогично, но set_prizes теперь принимает многострочный текст)
+# (Остальные обработчики меню без изменений, скопированы из предыдущей полной версии)
 @admin_router.callback_query(F.data == "set_chat")
 async def set_chat_start(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text("Введите ID чата (текущий: " +
@@ -972,11 +922,53 @@ async def clean_old_roulettes(bot: Bot):
         clean_expired_bans()
         await asyncio.sleep(3600)
 
+# ---------- Обработка проверки (общая функция) ----------
+async def handle_verify_token(message: types.Message, bot: Bot, token: str):
+    roulette = get_roulette_by_token(token)
+    if not roulette:
+        await message.answer("❌ Недействительный или устаревший токен проверки.")
+        return
+    participants = json.loads(roulette['participants_json']) if roulette['participants_json'] else []
+    winners_idx = json.loads(roulette['winners_json']) if roulette['winners_json'] else []
+    names = []
+    for uid in participants:
+        try:
+            m = await bot.get_chat_member(roulette['chat_id'], uid)
+            names.append(f"@{m.user.username}" if m.user.username else m.user.full_name)
+        except:
+            names.append(str(uid))
+    winners_names = [names[idx] for idx in winners_idx] if winners_idx else []
+    seed = roulette.get('seed', 'не указан')
+    seed_hash = roulette.get('seed_hash', 'не указан')
+    start_time = parse_datetime(roulette['start_time']).strftime('%d.%m.%Y %H:%M') if roulette['start_time'] else '?'
+    report = (
+        "🔍 <b>Проверка честности розыгрыша</b>\n\n"
+        f"📅 Дата: {start_time}\n"
+        f"👥 Участников: {len(participants)}\n"
+        f"🎲 Победители: {', '.join(winners_names) if winners_names else 'нет'}\n\n"
+        f"🔒 <b>Seed (секретное число):</b> <code>{seed}</code>\n"
+        f"📝 <b>Хеш SHA256:</b> <code>{seed_hash}</code>\n\n"
+    )
+    report += (
+        "ℹ️ <b>Как проверить:</b>\n"
+        "1. Убедитесь, что хеш совпадает с объявленным до начала розыгрыша.\n"
+        "2. Перейдите на сайт https://emn178.github.io/online-tools/sha256.html и введите seed — получите хеш. Сравните.\n"
+        "3. Выполните код Python (пример ниже).\n\n"
+        "<b>Код для проверки (Python):</b>\n"
+        "<code>import random\n"
+        "seed = '...'\n"
+        "participants = [...]\n"
+        "rng = random.Random(seed)\n"
+        "indices = list(range(len(participants)))\n"
+        "rng.shuffle(indices)\n"
+        "winners = [participants[i] for i in indices[:кол-во]]</code>\n\n"
+        "Если результат совпал — розыгрыш честный."
+    )
+    await message.answer(report, parse_mode='HTML')
+
 # ---------- Регистрация роутеров ----------
 def setup_routers(dp: Dispatcher, bot: Bot, main_admin_id: int):
-    global MAIN_ADMIN_ID, BOT_USERNAME
+    global MAIN_ADMIN_ID
     MAIN_ADMIN_ID = main_admin_id
-    BOT_USERNAME = (await bot.me()).username  # получаем username бота
-    dp.include_router(verify_router)  # сначала deep-link/verify
     dp.include_router(admin_router)
     dp.include_router(filter_router)
