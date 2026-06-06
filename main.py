@@ -29,7 +29,6 @@ except ValueError:
     sys.exit(1)
 
 async def health_check(request):
-    logger.debug(f"Health check from {request.remote}")
     return web.json_response({"status": "ok"})
 
 async def main():
@@ -37,9 +36,14 @@ async def main():
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
 
-    from roulette import setup_routers, init_db, queue_worker, clean_old_roulettes
+    from roulette import setup_routers, init_db, queue_worker, clean_old_roulettes, set_bot_username
 
     init_db()
+
+    # Получаем username бота и передаём в roulette
+    me = await bot.me()
+    set_bot_username(me.username)
+
     setup_routers(dp, bot, MAIN_ADMIN_ID)
 
     asyncio.create_task(queue_worker(bot))
@@ -55,7 +59,6 @@ async def main():
     await site.start()
     logger.info(f"Health-check server listening on port {PORT}")
 
-    # Graceful shutdown
     loop = asyncio.get_running_loop()
     def shutdown():
         logger.info("Shutting down...")
