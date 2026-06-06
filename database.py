@@ -29,7 +29,7 @@ def init_db():
             duration INTEGER DEFAULT 5,
             winners_count INTEGER DEFAULT 0,
             trigger TEXT DEFAULT '+',
-            prizes TEXT DEFAULT '[]',
+            prizes TEXT DEFAULT '',
             rules TEXT DEFAULT '',
             start_msg TEXT DEFAULT '',
             stop_msg TEXT DEFAULT '',
@@ -38,6 +38,7 @@ def init_db():
             winners_json TEXT DEFAULT '[]',
             seed_hash TEXT,
             seed TEXT,
+            verify_token TEXT,
             re_rolled_from INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
@@ -51,6 +52,11 @@ def init_db():
             channel_id TEXT PRIMARY KEY
         );
         """)
+        # Добавляем verify_token, если поле отсутствует (миграция)
+        try:
+            conn.execute("ALTER TABLE roulettes ADD COLUMN verify_token TEXT")
+        except:
+            pass
         defaults = {
             "trigger": "+",
             "duration": "5",
@@ -60,13 +66,12 @@ def init_db():
             "result_msg": "Победители:\n{winners}",
             "chat_id": "",
             "max_participants": "0",
-            "prizes": "[]"
+            "prizes": ""
         }
         for k, v in defaults.items():
             conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
 
 def parse_datetime(date_str: str) -> datetime:
-    """Преобразует строку в aware datetime с таймзоной Новосибирска."""
     try:
         dt = datetime.fromisoformat(date_str)
         if dt.tzinfo is None:
@@ -121,12 +126,12 @@ def clean_expired_bans():
 def save_roulette(chat_id: int, status: str, duration: int, winners_count: int,
                   trigger: str, prizes: str, rules: str, start_msg: str, stop_msg: str,
                   result_msg: str, start_time: datetime, stop_time: datetime,
-                  seed: str = None, seed_hash: str = None) -> int:
+                  seed: str = None, seed_hash: str = None, verify_token: str = None) -> int:
     with get_conn() as conn:
-        cur = conn.execute("""INSERT INTO roulettes (chat_id, status, duration, winners_count, trigger, prizes, rules, start_msg, stop_msg, result_msg, start_time, stop_time, seed, seed_hash)
-                      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        cur = conn.execute("""INSERT INTO roulettes (chat_id, status, duration, winners_count, trigger, prizes, rules, start_msg, stop_msg, result_msg, start_time, stop_time, seed, seed_hash, verify_token)
+                      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                       (chat_id, status, duration, winners_count, trigger, prizes, rules, start_msg, stop_msg, result_msg,
-                       start_time, stop_time, seed, seed_hash))
+                       start_time, stop_time, seed, seed_hash, verify_token))
         return cur.lastrowid
 
 def update_roulette(roulette_id: int, **kwargs):
@@ -146,6 +151,12 @@ def get_roulette(chat_id: int, status: Optional[str] = None) -> Optional[Dict[st
 def get_roulette_by_id(roulette_id: int) -> Optional[Dict[str, Any]]:
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM roulettes WHERE id=?", (roulette_id,)).fetchone()
+        return dict(row) if row else None
+
+def get_roulette_by_token(token: str) -> Optional[Dict[str, Any]]:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM roulettes WHERE verify_token=? AND start_time > ?",
+                           (token, datetime.now() - timedelta(days=30))).fetchone()
         return dict(row) if row else None
 
 def get_last_finished_roulette(chat_id: int) -> Optional[Dict[str, Any]]:
