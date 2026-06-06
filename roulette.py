@@ -5,6 +5,7 @@ import re
 import secrets
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple
+from html import escape as escape_html
 
 import pytz
 from aiogram import Router, F, types, Bot, Dispatcher
@@ -32,7 +33,7 @@ message_queue = asyncio.Queue()
 logger = logging.getLogger(__name__)
 
 MAIN_ADMIN_ID = None
-BOT_USERNAME = None  # будет установлена из main.py
+BOT_USERNAME = None
 
 def set_bot_username(username: str):
     global BOT_USERNAME
@@ -109,7 +110,7 @@ def substitute(template: str, **kwargs) -> str:
     return template
 
 async def send_template(bot: Bot, chat_id: int, template_str: str, **substitutions) -> types.Message:
-    """Отправляет шаблон (поддержка HTML, медиа, пересылка)"""
+    """Отправляет шаблон с поддержкой HTML, медиа и пересылки. Для медиа передаёт caption_entities, если они есть."""
     try:
         data = json.loads(template_str)
         if isinstance(data, dict):
@@ -123,14 +124,19 @@ async def send_template(bot: Bot, chat_id: int, template_str: str, **substitutio
                 caption = substitute(data.get('caption', ''), **substitutions)
                 if len(caption) > 1024:
                     caption = caption[:1020] + "..."
+                # Извлекаем entities из сохранённого шаблона (если есть)
+                caption_entities = None
+                if data.get('entities'):
+                    # entities хранятся как список сериализованных объектов
+                    caption_entities = [MessageEntity(**e) for e in data['entities']]
                 if media_type == 'photo':
-                    return await bot.send_photo(chat_id, photo=file_id, caption=caption)
+                    return await bot.send_photo(chat_id, photo=file_id, caption=caption, caption_entities=caption_entities)
                 elif media_type == 'video':
-                    return await bot.send_video(chat_id, video=file_id, caption=caption)
+                    return await bot.send_video(chat_id, video=file_id, caption=caption, caption_entities=caption_entities)
                 elif media_type == 'animation':
-                    return await bot.send_animation(chat_id, animation=file_id, caption=caption)
+                    return await bot.send_animation(chat_id, animation=file_id, caption=caption, caption_entities=caption_entities)
                 elif media_type == 'document':
-                    return await bot.send_document(chat_id, document=file_id, caption=caption)
+                    return await bot.send_document(chat_id, document=file_id, caption=caption, caption_entities=caption_entities)
                 else:
                     return await bot.send_message(chat_id, caption)
             elif data.get('type') == 'text':
@@ -138,47 +144,59 @@ async def send_template(bot: Bot, chat_id: int, template_str: str, **substitutio
                 return await bot.send_message(chat_id, text, parse_mode='HTML')
     except:
         pass
-    # Обычный текст (HTML)
+    # Обычный текст
     text = substitute(template_str, **substitutions)
     return await bot.send_message(chat_id, text, parse_mode='HTML')
 
 def save_media_template(message: types.Message) -> str:
-    """Сохраняет шаблон: медиа/пересылка/HTML-текст"""
+    """Сохраняет шаблон: медиа/пересылка/HTML-текст с entities."""
     if message.forward_from_chat and message.forward_from_message_id:
         return json.dumps({'type': 'forward', 'chat_id': message.forward_from_chat.id,
                            'message_id': message.forward_from_message_id})
     if message.photo:
         file_id = message.photo[-1].file_id
+        entities = []
+        if message.caption_entities:
+            entities = [ent.model_dump() for ent in message.caption_entities]
         return json.dumps({'type': 'media', 'media_type': 'photo', 'file_id': file_id,
-                           'caption': message.caption or ''})
+                           'caption': message.caption or '', 'entities': entities})
     if message.video:
+        entities = []
+        if message.caption_entities:
+            entities = [ent.model_dump() for ent in message.caption_entities]
         return json.dumps({'type': 'media', 'media_type': 'video', 'file_id': message.video.file_id,
-                           'caption': message.caption or ''})
+                           'caption': message.caption or '', 'entities': entities})
     if message.animation:
+        entities = []
+        if message.caption_entities:
+            entities = [ent.model_dump() for ent in message.caption_entities]
         return json.dumps({'type': 'media', 'media_type': 'animation', 'file_id': message.animation.file_id,
-                           'caption': message.caption or ''})
+                           'caption': message.caption or '', 'entities': entities})
     if message.document:
+        entities = []
+        if message.caption_entities:
+            entities = [ent.model_dump() for ent in message.caption_entities]
         return json.dumps({'type': 'media', 'media_type': 'document', 'file_id': message.document.file_id,
-                           'caption': message.caption or ''})
-    # Текст с HTML (aiogram автоматически преобразует entities в html_text)
+                           'caption': message.caption or '', 'entities': entities})
+    # Текст с HTML
     if message.text:
         return message.html_text
     return message.text or ''
 
 def format_setting(value: str) -> str:
-    """Краткое отображение значения настройки в меню"""
+    """Безопасное отображение в HTML (экранирование)."""
     try:
         data = json.loads(value)
         if isinstance(data, dict):
             if data.get('type') == 'text':
-                return data.get('text', '')[:50] + ('...' if len(data.get('text',''))>50 else '')
+                return escape_html(data.get('text', '')[:50]) + ('...' if len(data.get('text',''))>50 else '')
             elif data.get('type') == 'media':
                 return f"[{data.get('media_type','медиа')}]"
             elif data.get('type') == 'forward':
                 return "[пересланное]"
     except:
         pass
-    return value[:50].replace('\n', ' ')
+    return escape_html(value[:50].replace('\n', ' '))
 
 def generate_token() -> str:
     return secrets.token_hex(8)
@@ -251,26 +269,94 @@ class RouletteSession:
 
 active_sessions: Dict[int, RouletteSession] = {}
 
-# ---------- Роутер (теперь только админский, без verify_router) ----------
+# ---------- Роутеры ----------
 admin_router = Router()
 filter_router = Router()
 
-# ---------- /start (меню админа + deep-link проверка) ----------
+# ---------- /start ----------
 @admin_router.message(Command('start'))
 async def start_cmd(message: types.Message, bot: Bot, command: CommandObject = None):
     if message.chat.type != 'private':
         return
-    # Если главный админ – показываем меню (игнорируем deep-link)
     if message.from_user.id == MAIN_ADMIN_ID:
         await menu(message)
         return
-    # Для обычных пользователей: если есть токен – проверка
     if command and command.args:
         token = command.args.strip()
         if token:
             await handle_verify_token(message, bot, token)
             return
-    await message.answer("ℹ️ Я бот для честных рулеток. Для проверки используйте ссылку из результатов розыгрыша.")
+    # Обычный пользователь – предлагаем проверку
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔍 Проверить розыгрыш", callback_data="verify_manual")
+    await message.answer("ℹ️ Я бот для честных рулеток. Для проверки используйте ссылку из результатов розыгрыша или нажмите кнопку ниже.", reply_markup=kb.as_markup())
+
+# Альтернативная проверка для обычных пользователей
+class VerifyForm(StatesGroup):
+    waiting_for_seed = State()
+    waiting_for_hash = State()
+    waiting_for_participants = State()
+
+@admin_router.callback_query(F.data == "verify_manual")
+async def start_manual_verify(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id == MAIN_ADMIN_ID:
+        await call.answer("Админам не нужна проверка 😉")
+        return
+    await call.message.answer("Введите seed:")
+    await state.set_state(VerifyForm.waiting_for_seed)
+    await call.answer()
+
+@admin_router.message(StateFilter(VerifyForm.waiting_for_seed))
+async def process_seed(message: types.Message, state: FSMContext):
+    await state.update_data(seed=message.text.strip())
+    await message.answer("Введите хеш (SHA256):")
+    await state.set_state(VerifyForm.waiting_for_hash)
+
+@admin_router.message(StateFilter(VerifyForm.waiting_for_hash))
+async def process_hash(message: types.Message, state: FSMContext):
+    await state.update_data(hash=message.text.strip())
+    await message.answer("Введите список участников (каждый с новой строки, в порядке записи):")
+    await state.set_state(VerifyForm.waiting_for_participants)
+
+@admin_router.message(StateFilter(VerifyForm.waiting_for_participants))
+async def process_participants(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    seed = data['seed']
+    expected_hash = data['hash']
+    participants = [p.strip() for p in message.text.strip().split('\n') if p.strip()]
+    # Проверяем хеш
+    import hashlib
+    computed_hash = hashlib.sha256(seed.encode()).hexdigest()
+    if computed_hash != expected_hash:
+        await message.answer("❌ Хеш не совпадает! Результаты могли быть подделаны.")
+        await state.clear()
+        return
+    # Генерируем победителей (нужно знать количество, спросим)
+    await state.update_data(participants=participants, seed=seed)
+    await message.answer("Введите количество победителей:")
+    await state.set_state('waiting_winners_count')
+
+@admin_router.message(StateFilter('waiting_winners_count'))
+async def process_winners_count(message: types.Message, state: FSMContext):
+    try:
+        count = int(message.text.strip())
+    except:
+        await message.answer("Введите число.")
+        return
+    data = await state.get_data()
+    participants = data['participants']
+    if count > len(participants):
+        await message.answer("Победителей больше, чем участников.")
+        return
+    # Выбираем победителей
+    rng = __import__('random').Random(data['seed'])
+    indices = list(range(len(participants)))
+    rng.shuffle(indices)
+    winners = [participants[i] for i in indices[:count]]
+    # Выводим результат
+    report = f"🔒 Seed: <code>{data['seed']}</code>\n✅ Хеш совпадает!\n\n<b>Победители:</b>\n" + "\n".join(f"• {w}" for w in winners)
+    await message.answer(report, parse_mode='HTML')
+    await state.clear()
 
 # ---------- @рулетка ----------
 @admin_router.message(F.text.regexp(r'@рулетка\s+(.+)'))
@@ -320,6 +406,7 @@ async def roulette_cmd(message: types.Message, bot: Bot):
     if prizes_list:
         announce += "\n<b>Призы:</b>\n" + "\n".join(f"• {p}" for p in prizes_list)
     enqueue(chat_id, 'send_message', text=announce, parse_mode='HTML')
+    # Правила сразу после анонса
     rules = get_setting('rules')
     if rules:
         enqueue(chat_id, 'send_message', text=substitute(rules, trigger=trigger, duration=str(duration)), parse_mode='HTML')
@@ -327,6 +414,41 @@ async def roulette_cmd(message: types.Message, bot: Bot):
         asyncio.create_task(schedule_start(bot, chat_id, rid, (start_time - now).total_seconds()))
     else:
         await start_recording(bot, chat_id, rid)
+
+# ---------- Удаление триггеров до старта (в waiting_start) ----------
+@filter_router.message(lambda msg: msg.chat.id in active_sessions or get_roulette(msg.chat.id, 'waiting_start'))
+async def pre_start_filter(message: types.Message, bot: Bot):
+    if message.chat.type == 'private':
+        return
+    chat_id = message.chat.id
+    if await is_admin(bot, chat_id, message.from_user.id):
+        return
+    # Если уже активна запись, обрабатывает основной фильтр, сюда не попадаем (проверим)
+    if chat_id in active_sessions:
+        return  # основная сессия активна, пропускаем
+    roulette = get_roulette(chat_id, 'waiting_start')
+    if not roulette:
+        return
+    trigger = roulette['trigger']
+    text = message.text or message.caption or ''
+    if text.strip().lower() == trigger.lower():
+        # Удаляем триггер
+        await message.delete()
+        # Проверяем, не было ли уже уведомления этому пользователю
+        # Храним в словаре pre_warned (user_id -> message_id)
+        if not hasattr(pre_start_filter, 'warned'):
+            pre_start_filter.warned = {}
+        prev_msg_id = pre_start_filter.warned.get(message.from_user.id)
+        if prev_msg_id:
+            try:
+                await bot.delete_message(chat_id, prev_msg_id)
+            except:
+                pass
+        # Отправляем новое уведомление (с задержкой 2 сек)
+        sent = await bot.send_message(chat_id, f"⏳ {message.from_user.full_name}, запись ещё не началась. Ожидайте старта.")
+        pre_start_filter.warned[message.from_user.id] = sent.message_id
+        # Задержка 2 сек уже есть в очереди? Нет, используем asyncio.sleep(2) внутри send_message? Лучше просто отправить, т.к. частота низкая.
+        await asyncio.sleep(2)
 
 # ---------- @отмена ----------
 @admin_router.message(F.text.regexp(r'@отмена'))
@@ -446,7 +568,6 @@ async def reroll_cmd(message: types.Message, bot: Bot):
     if old_names:
         crossed = ", ".join(f"<s>{n}</s>" for n in old_names)
         caption_text += f"\n\nЛишились призов: {crossed}"
-    # Используем шаблон результата (если текстовый) с подстановкой
     result_template = last['result_msg']
     try:
         tmpl_data = json.loads(result_template)
@@ -482,10 +603,18 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     roulette = get_roulette_by_id(rid)
     if not roulette or roulette['status'] != 'waiting_start':
         return
+    # Отправляем правила ещё раз перед стартом (с задержкой)
+    rules = roulette['rules']
+    if rules:
+        await send_template(bot, chat_id, rules, trigger=roulette['trigger'],
+                            duration=str(roulette['duration']), seed_hash=roulette.get('seed_hash',''))
+        await asyncio.sleep(2)
+    # Стартовое сообщение
     start = roulette['start_msg']
     if start:
         await send_template(bot, chat_id, start, trigger=roulette['trigger'])
         await asyncio.sleep(2)
+    # Создаём сессию записи
     session = RouletteSession(chat_id, rid, roulette['trigger'])
     active_sessions[chat_id] = session
     update_roulette(rid, status='recording')
@@ -494,10 +623,12 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     delay = (stop_time - datetime.now(NOVOSIBIRSK)).total_seconds()
     if delay > 0:
         await asyncio.sleep(delay)
+    # Стоп-сообщение
     stop = roulette['stop_msg']
     if stop:
         await send_template(bot, chat_id, stop)
         await asyncio.sleep(2)
+    # Финализация участников
     valid_users = await session.finalize(bot)
     names_clean = []
     names_with_at = []
@@ -531,6 +662,7 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
         img_file = BufferedInputFile(img_bytes.read(), filename="result.png")
         prizes_raw = roulette['prizes'] or ''
         prizes_list = [p.strip() for p in prizes_raw.split('\n') if p.strip()] if prizes_raw else []
+        # Победители без номеров
         winners_lines = []
         for i, name in enumerate(wnames_with_at):
             prize = prizes_list[i] if i < len(prizes_list) else "не указан"
@@ -556,11 +688,12 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     else:
         update_roulette(rid, status='finished', participants_json=json.dumps(valid_users))
         enqueue(chat_id, 'send_message', text="Админ, проведите розыгрыш самостоятельно.")
+    # Размут всех замьюченных
     for uid in session.muted_users:
         await unmute_user(bot, chat_id, uid)
     active_sessions.pop(chat_id, None)
 
-# ---------- Фильтр сообщений участников ----------
+# ---------- Фильтр сообщений участников (основная запись) ----------
 async def has_active_session(message: types.Message) -> bool:
     return message.chat.id in active_sessions
 
@@ -657,13 +790,13 @@ async def back_menu(call: types.CallbackQuery, state: FSMContext):
 @admin_router.callback_query(F.data == "view")
 async def view_settings(call: types.CallbackQuery):
     prizes_raw = get_setting('prizes') or ''
-    prizes_display = prizes_raw.replace('\n', ', ') if prizes_raw else 'нет'
+    prizes_display = escape_html(prizes_raw.replace('\n', ', ')) if prizes_raw else 'нет'
     s = f"""<b>Текущие настройки:</b>
-Триггер: {get_setting('trigger')}
-Длительность: {get_setting('duration')} мин
-Макс. участников: {get_setting('max_participants') or 'нет'}
-Чат: {get_setting('chat_id') or 'не задан'}
-Каналы: {', '.join(get_channels()) or 'нет'}
+Триггер: {escape_html(get_setting('trigger'))}
+Длительность: {escape_html(get_setting('duration'))} мин
+Макс. участников: {escape_html(get_setting('max_participants')) or 'нет'}
+Чат: {escape_html(get_setting('chat_id')) or 'не задан'}
+Каналы: {escape_html(', '.join(get_channels())) if get_channels() else 'нет'}
 Призы: {prizes_display}
 Правила: {format_setting(get_setting('rules'))}
 Старт: {format_setting(get_setting('start_msg'))}
@@ -672,11 +805,11 @@ async def view_settings(call: types.CallbackQuery):
     await call.message.edit_text(s, reply_markup=back_btn(), parse_mode='HTML')
     await call.answer()
 
-# (Остальные обработчики меню без изменений, скопированы из предыдущей полной версии)
+# Обработчики меню (без изменений, экранирование уже внутри format_setting)
 @admin_router.callback_query(F.data == "set_chat")
 async def set_chat_start(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text("Введите ID чата (текущий: " +
-                                 (get_setting('chat_id') or 'не задан') + ")", reply_markup=back_btn())
+                                 escape_html(get_setting('chat_id') or 'не задан') + ")", reply_markup=back_btn())
     await state.set_state(SettingsForm.waiting_for_chat_id)
     await call.answer()
 
@@ -696,7 +829,7 @@ async def set_chat_finish(message: types.Message, state: FSMContext):
 @admin_router.callback_query(F.data == "set_duration")
 async def set_duration_start(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text("Введите длительность в минутах (сейчас " +
-                                 get_setting('duration') + "):", reply_markup=back_btn())
+                                 escape_html(get_setting('duration')) + "):", reply_markup=back_btn())
     await state.set_state(SettingsForm.waiting_for_duration)
     await call.answer()
 
@@ -712,7 +845,7 @@ async def set_duration_finish(message: types.Message, state: FSMContext):
 @admin_router.callback_query(F.data == "set_trigger")
 async def set_trigger_start(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text("Отправьте новый триггер (сейчас «" +
-                                 get_setting('trigger') + "»):", reply_markup=back_btn())
+                                 escape_html(get_setting('trigger')) + "»):", reply_markup=back_btn())
     await state.set_state(SettingsForm.waiting_for_trigger)
     await call.answer()
 
@@ -721,7 +854,7 @@ async def set_trigger_finish(message: types.Message, state: FSMContext):
     new_trigger = message.text.strip() if message.text else ""
     if new_trigger:
         set_setting('trigger', new_trigger)
-        await message.answer(f"Триггер: «{new_trigger}»", reply_markup=back_btn())
+        await message.answer(f"Триггер: «{escape_html(new_trigger)}»", reply_markup=back_btn())
     else:
         await message.answer("Не может быть пустым.", reply_markup=back_btn())
     await state.clear()
@@ -729,7 +862,7 @@ async def set_trigger_finish(message: types.Message, state: FSMContext):
 @admin_router.callback_query(F.data == "set_prizes")
 async def set_prizes_start(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text("Введите призы, каждый с новой строки (сейчас:\n" +
-                                 (get_setting('prizes') or 'нет') + ")", reply_markup=back_btn())
+                                 escape_html(get_setting('prizes') or 'нет') + ")", reply_markup=back_btn())
     await state.set_state(SettingsForm.waiting_for_prizes)
     await call.answer()
 
@@ -802,7 +935,9 @@ async def channels_menu(call: types.CallbackQuery):
     kb.button(text="➕ Добавить канал", callback_data="channel_add")
     kb.button(text="➖ Удалить канал", callback_data="channel_del")
     kb.button(text="« Назад", callback_data="back_to_menu")
-    await call.message.edit_text("Каналы: " + ", ".join(get_channels() or ["нет"]),
+    channels_list = get_channels()
+    channels_text = ', '.join(channels_list) if channels_list else 'нет'
+    await call.message.edit_text("Каналы: " + escape_html(channels_text),
                                  reply_markup=kb.as_markup())
     await call.answer()
 
@@ -881,7 +1016,7 @@ async def ban_add_finish(message: types.Message, state: FSMContext):
         except:
             await message.answer("ID должен быть числом.", reply_markup=back_btn())
             return
-    await message.answer(f"Пользователь {user_ident} забанен на {days} дн.", reply_markup=back_btn())
+    await message.answer(f"Пользователь {escape_html(user_ident)} забанен на {days} дн.", reply_markup=back_btn())
     await state.clear()
 
 @admin_router.callback_query(F.data == "ban_list")
@@ -902,7 +1037,7 @@ async def ban_list_view(call: types.CallbackQuery):
 @admin_router.callback_query(F.data == "set_max")
 async def set_max_start(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text("Введите максимум участников (0 — без ограничения). Сейчас: " +
-                                 (get_setting('max_participants') or '0'), reply_markup=back_btn())
+                                 escape_html(get_setting('max_participants') or '0'), reply_markup=back_btn())
     await state.set_state(SettingsForm.waiting_for_max)
     await call.answer()
 
@@ -914,13 +1049,6 @@ async def set_max_finish(message: types.Message, state: FSMContext):
     else:
         await message.answer("Введите число.", reply_markup=back_btn())
     await state.clear()
-
-# ---------- Периодическая очистка ----------
-async def clean_old_roulettes(bot: Bot):
-    while True:
-        delete_old_roulettes(48)
-        clean_expired_bans()
-        await asyncio.sleep(3600)
 
 # ---------- Обработка проверки (общая функция) ----------
 async def handle_verify_token(message: types.Message, bot: Bot, token: str):
@@ -941,30 +1069,42 @@ async def handle_verify_token(message: types.Message, bot: Bot, token: str):
     seed = roulette.get('seed', 'не указан')
     seed_hash = roulette.get('seed_hash', 'не указан')
     start_time = parse_datetime(roulette['start_time']).strftime('%d.%m.%Y %H:%M') if roulette['start_time'] else '?'
+    # Готовый Python-код с подставленными данными
+    participants_code = json.dumps(participants, ensure_ascii=False)
+    python_code = (
+        "import random\n"
+        f"seed = {repr(seed)}\n"
+        f"participants = {participants_code}\n"
+        f"winners_count = {len(winners_idx)}\n"
+        "rng = random.Random(seed)\n"
+        "indices = list(range(len(participants)))\n"
+        "rng.shuffle(indices)\n"
+        "winners = [participants[i] for i in indices[:winners_count]]\n"
+        "print(winners)"
+    )
     report = (
         "🔍 <b>Проверка честности розыгрыша</b>\n\n"
         f"📅 Дата: {start_time}\n"
         f"👥 Участников: {len(participants)}\n"
         f"🎲 Победители: {', '.join(winners_names) if winners_names else 'нет'}\n\n"
-        f"🔒 <b>Seed (секретное число):</b> <code>{seed}</code>\n"
-        f"📝 <b>Хеш SHA256:</b> <code>{seed_hash}</code>\n\n"
-    )
-    report += (
+        f"🔒 <b>Seed (секретное число):</b> <code>{escape_html(seed)}</code>\n"
+        f"📝 <b>Хеш SHA256:</b> <code>{escape_html(seed_hash)}</code>\n\n"
         "ℹ️ <b>Как проверить:</b>\n"
         "1. Убедитесь, что хеш совпадает с объявленным до начала розыгрыша.\n"
         "2. Перейдите на сайт https://emn178.github.io/online-tools/sha256.html и введите seed — получите хеш. Сравните.\n"
-        "3. Выполните код Python (пример ниже).\n\n"
-        "<b>Код для проверки (Python):</b>\n"
-        "<code>import random\n"
-        "seed = '...'\n"
-        "participants = [...]\n"
-        "rng = random.Random(seed)\n"
-        "indices = list(range(len(participants)))\n"
-        "rng.shuffle(indices)\n"
-        "winners = [participants[i] for i in indices[:кол-во]]</code>\n\n"
+        "3. Скопируйте и выполните код Python ниже — он выдаст победителей.\n\n"
+        "<b>Готовый код для проверки:</b>\n"
+        f"<pre>{escape_html(python_code)}</pre>\n\n"
         "Если результат совпал — розыгрыш честный."
     )
     await message.answer(report, parse_mode='HTML')
+
+# ---------- Периодическая очистка ----------
+async def clean_old_roulettes(bot: Bot):
+    while True:
+        delete_old_roulettes(48)
+        clean_expired_bans()
+        await asyncio.sleep(3600)
 
 # ---------- Регистрация роутеров ----------
 def setup_routers(dp: Dispatcher, bot: Bot, main_admin_id: int):
