@@ -12,8 +12,8 @@ from aiogram import Router, F, types, Bot, Dispatcher
 from aiogram.filters import Command, StateFilter, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.types import ChatPermissions, BufferedInputFile, MessageEntity, InputMediaPhoto
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+from aiogram.types import ChatPermissions, BufferedInputFile, InputMediaPhoto, ReplyKeyboardMarkup
 from aiogram.exceptions import TelegramBadRequest
 
 from database import (
@@ -110,7 +110,7 @@ def substitute(template: str, **kwargs) -> str:
     return template
 
 async def send_template(bot: Bot, chat_id: int, template_str: str, **substitutions) -> types.Message:
-    """Отправляет шаблон с поддержкой HTML и медиа. Для медиа caption_entities не передаются (чтобы избежать рассинхрона)."""
+    """Отправляет шаблон с поддержкой HTML и медиа. Теперь для медиа включён parse_mode='HTML'."""
     try:
         data = json.loads(template_str)
         if isinstance(data, dict):
@@ -125,13 +125,13 @@ async def send_template(bot: Bot, chat_id: int, template_str: str, **substitutio
                 if len(caption) > 1024:
                     caption = caption[:1020] + "..."
                 if media_type == 'photo':
-                    return await bot.send_photo(chat_id, photo=file_id, caption=caption)
+                    return await bot.send_photo(chat_id, photo=file_id, caption=caption, parse_mode='HTML')
                 elif media_type == 'video':
-                    return await bot.send_video(chat_id, video=file_id, caption=caption)
+                    return await bot.send_video(chat_id, video=file_id, caption=caption, parse_mode='HTML')
                 elif media_type == 'animation':
-                    return await bot.send_animation(chat_id, animation=file_id, caption=caption)
+                    return await bot.send_animation(chat_id, animation=file_id, caption=caption, parse_mode='HTML')
                 elif media_type == 'document':
-                    return await bot.send_document(chat_id, document=file_id, caption=caption)
+                    return await bot.send_document(chat_id, document=file_id, caption=caption, parse_mode='HTML')
                 else:
                     return await bot.send_message(chat_id, caption)
             elif data.get('type') == 'text':
@@ -256,6 +256,12 @@ active_sessions: Dict[int, RouletteSession] = {}
 admin_router = Router()
 filter_router = Router()
 
+# ---------- Reply‑клавиатура для обычных пользователей ----------
+def user_reply_kb():
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="🔍 Проверить результат")
+    return kb.as_markup(resize_keyboard=True)
+
 # ---------- /start ----------
 @admin_router.message(Command('start'))
 async def start_cmd(message: types.Message, bot: Bot, command: CommandObject = None):
@@ -269,24 +275,26 @@ async def start_cmd(message: types.Message, bot: Bot, command: CommandObject = N
         if token:
             await handle_verify_token(message, bot, token)
             return
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🔍 Проверить розыгрыш", callback_data="verify_manual")
-    await message.answer("ℹ️ Я бот для честных рулеток. Для проверки используйте ссылку из результатов розыгрыша или нажмите кнопку ниже.", reply_markup=kb.as_markup())
+    # Обычный пользователь – reply‑клавиатура с проверкой
+    await message.answer(
+        "ℹ️ Я бот для честных рулеток. Для проверки результата нажмите кнопку ниже или используйте ссылку.",
+        reply_markup=user_reply_kb()
+    )
 
-# ---------- Альтернативная проверка ----------
+# ---------- Обработка нажатия reply‑кнопки ----------
+@admin_router.message(lambda msg: msg.chat.type == 'private' and msg.text == "🔍 Проверить результат")
+async def manual_verify_start(message: types.Message, state: FSMContext):
+    if message.from_user.id == MAIN_ADMIN_ID:
+        await message.answer("Админам не нужна проверка 😉")
+        return
+    await message.answer("Введите seed:", reply_markup=types.ReplyKeyboardRemove())
+    await state.set_state(VerifyForm.waiting_for_seed)
+
+# ---------- Альтернативная проверка (FSM) ----------
 class VerifyForm(StatesGroup):
     waiting_for_seed = State()
     waiting_for_hash = State()
     waiting_for_participants = State()
-
-@admin_router.callback_query(F.data == "verify_manual")
-async def start_manual_verify(call: types.CallbackQuery, state: FSMContext):
-    if call.from_user.id == MAIN_ADMIN_ID:
-        await call.answer("Админам не нужна проверка 😉")
-        return
-    await call.message.answer("Введите seed:")
-    await state.set_state(VerifyForm.waiting_for_seed)
-    await call.answer()
 
 @admin_router.message(StateFilter(VerifyForm.waiting_for_seed))
 async def process_seed(message: types.Message, state: FSMContext):
@@ -309,7 +317,7 @@ async def process_participants(message: types.Message, state: FSMContext):
     import hashlib
     computed_hash = hashlib.sha256(seed.encode()).hexdigest()
     if computed_hash != expected_hash:
-        await message.answer("❌ Хеш не совпадает! Результаты могли быть подделаны.")
+        await message.answer("❌ Хеш не совпадает! Результаты могли быть подделаны.", reply_markup=user_reply_kb())
         await state.clear()
         return
     await state.update_data(participants=participants, seed=seed)
@@ -333,7 +341,7 @@ async def process_winners_count(message: types.Message, state: FSMContext):
     rng.shuffle(indices)
     winners = [participants[i] for i in indices[:count]]
     report = f"🔒 Seed: <code>{escape_html(data['seed'])}</code>\n✅ Хеш совпадает!\n\n<b>Победители:</b>\n" + "\n".join(f"• {escape_html(w)}" for w in winners)
-    await message.answer(report, parse_mode='HTML')
+    await message.answer(report, parse_mode='HTML', reply_markup=user_reply_kb())
     await state.clear()
 
 # ---------- @рулетка ----------
@@ -374,6 +382,9 @@ async def roulette_cmd(message: types.Message, bot: Bot):
                         get_setting('start_msg'), get_setting('stop_msg'),
                         get_setting('result_msg'), start_time, stop_time,
                         seed=seed, seed_hash=seed_hash, verify_token=verify_token)
+    # Обрезаем призы под количество победителей
+    if winners and prizes_list:
+        prizes_list = prizes_list[:winners]
     announce = (
         f"📢 <b>Рулетка</b>\n"
         f"Победителей: {winners if winners else 'определит админ'}\n"
@@ -384,10 +395,7 @@ async def roulette_cmd(message: types.Message, bot: Bot):
     if prizes_list:
         announce += "\n<b>Призы:</b>\n" + "\n".join(f"• {p}" for p in prizes_list)
     enqueue(chat_id, 'send_message', text=announce, parse_mode='HTML')
-    # Правила сразу после анонса
-    rules = get_setting('rules')
-    if rules:
-        enqueue(chat_id, 'send_message', text=substitute(rules, trigger=trigger, duration=str(duration)), parse_mode='HTML')
+    # Правила после анонса убраны, останутся только перед стартом
     if start_time > now:
         asyncio.create_task(schedule_start(bot, chat_id, rid, (start_time - now).total_seconds()))
     else:
@@ -533,7 +541,8 @@ async def reroll_cmd(message: types.Message, bot: Bot):
     for i, idx in enumerate(final_winners):
         name = names[idx] if idx < len(names) else str(participants[idx])
         prize = prizes_list[i] if i < len(prizes_list) else "не указан"
-        new_winners_lines.append(f"{name} ({prize})")
+        uid_str = participants[idx]
+        new_winners_lines.append(f"{name} ({prize})\n#id{uid_str}")
     caption_text = "\n".join(new_winners_lines)
     if old_names:
         crossed = ", ".join(f"<s>{n}</s>" for n in old_names)
@@ -573,7 +582,7 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     roulette = get_roulette_by_id(rid)
     if not roulette or roulette['status'] != 'waiting_start':
         return
-    # Отправляем правила ещё раз перед стартом (с задержкой)
+    # Правила только перед стартом
     rules = roulette['rules']
     if rules:
         await send_template(bot, chat_id, rules, trigger=roulette['trigger'],
@@ -584,7 +593,6 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     if start:
         await send_template(bot, chat_id, start, trigger=roulette['trigger'])
         await asyncio.sleep(2)
-    # Создаём сессию записи
     session = RouletteSession(chat_id, rid, roulette['trigger'])
     active_sessions[chat_id] = session
     update_roulette(rid, status='recording')
@@ -598,7 +606,6 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     if stop:
         await send_template(bot, chat_id, stop)
         await asyncio.sleep(2)
-    # Финализация участников
     valid_users = await session.finalize(bot)
     names_clean = []
     names_with_at = []
@@ -632,11 +639,11 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
         img_file = BufferedInputFile(img_bytes.read(), filename="result.png")
         prizes_raw = roulette['prizes'] or ''
         prizes_list = [p.strip() for p in prizes_raw.split('\n') if p.strip()] if prizes_raw else []
-        # Победители без номеров
         winners_lines = []
-        for i, name in enumerate(wnames_with_at):
+        for i, uid in enumerate(winners):
+            name = wnames_with_at[i]
             prize = prizes_list[i] if i < len(prizes_list) else "не указан"
-            winners_lines.append(f"{name} ({prize})")
+            winners_lines.append(f"{name} ({prize})\n#id{uid}")
         wstr = "\n".join(winners_lines)
         result_template = roulette['result_msg']
         try:
@@ -658,12 +665,11 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     else:
         update_roulette(rid, status='finished', participants_json=json.dumps(valid_users))
         enqueue(chat_id, 'send_message', text="Админ, проведите розыгрыш самостоятельно.")
-    # Размут всех замьюченных
     for uid in session.muted_users:
         await unmute_user(bot, chat_id, uid)
     active_sessions.pop(chat_id, None)
 
-# ---------- Фильтр сообщений участников (основная запись) ----------
+# ---------- Фильтр сообщений участников ----------
 async def has_active_session(message: types.Message) -> bool:
     return message.chat.id in active_sessions
 
@@ -775,7 +781,6 @@ async def view_settings(call: types.CallbackQuery):
     await call.message.edit_text(s, reply_markup=back_btn(), parse_mode='HTML')
     await call.answer()
 
-# Обработчики меню (без изменений, с экранированием)
 @admin_router.callback_query(F.data == "set_chat")
 async def set_chat_start(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text("Введите ID чата (текущий: " +
@@ -1020,7 +1025,7 @@ async def set_max_finish(message: types.Message, state: FSMContext):
         await message.answer("Введите число.", reply_markup=back_btn())
     await state.clear()
 
-# ---------- Обработка проверки (общая функция) ----------
+# ---------- Обработка проверки по токену ----------
 async def handle_verify_token(message: types.Message, bot: Bot, token: str):
     roulette = get_roulette_by_token(token)
     if not roulette:
@@ -1066,7 +1071,7 @@ async def handle_verify_token(message: types.Message, bot: Bot, token: str):
         f"<pre>{escape_html(python_code)}</pre>\n\n"
         "Если результат совпал — розыгрыш честный."
     )
-    await message.answer(report, parse_mode='HTML')
+    await message.answer(report, parse_mode='HTML', reply_markup=user_reply_kb() if message.from_user.id != MAIN_ADMIN_ID else None)
 
 # ---------- Периодическая очистка ----------
 async def clean_old_roulettes(bot: Bot):
