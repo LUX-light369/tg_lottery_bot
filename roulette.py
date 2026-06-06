@@ -110,7 +110,7 @@ def substitute(template: str, **kwargs) -> str:
     return template
 
 async def send_template(bot: Bot, chat_id: int, template_str: str, **substitutions) -> types.Message:
-    """Отправляет шаблон с поддержкой HTML, медиа и пересылки. Для медиа передаёт caption_entities, если они есть."""
+    """Отправляет шаблон с поддержкой HTML и медиа. Для медиа caption_entities не передаются (чтобы избежать рассинхрона)."""
     try:
         data = json.loads(template_str)
         if isinstance(data, dict):
@@ -124,19 +124,14 @@ async def send_template(bot: Bot, chat_id: int, template_str: str, **substitutio
                 caption = substitute(data.get('caption', ''), **substitutions)
                 if len(caption) > 1024:
                     caption = caption[:1020] + "..."
-                # Извлекаем entities из сохранённого шаблона (если есть)
-                caption_entities = None
-                if data.get('entities'):
-                    # entities хранятся как список сериализованных объектов
-                    caption_entities = [MessageEntity(**e) for e in data['entities']]
                 if media_type == 'photo':
-                    return await bot.send_photo(chat_id, photo=file_id, caption=caption, caption_entities=caption_entities)
+                    return await bot.send_photo(chat_id, photo=file_id, caption=caption)
                 elif media_type == 'video':
-                    return await bot.send_video(chat_id, video=file_id, caption=caption, caption_entities=caption_entities)
+                    return await bot.send_video(chat_id, video=file_id, caption=caption)
                 elif media_type == 'animation':
-                    return await bot.send_animation(chat_id, animation=file_id, caption=caption, caption_entities=caption_entities)
+                    return await bot.send_animation(chat_id, animation=file_id, caption=caption)
                 elif media_type == 'document':
-                    return await bot.send_document(chat_id, document=file_id, caption=caption, caption_entities=caption_entities)
+                    return await bot.send_document(chat_id, document=file_id, caption=caption)
                 else:
                     return await bot.send_message(chat_id, caption)
             elif data.get('type') == 'text':
@@ -149,35 +144,23 @@ async def send_template(bot: Bot, chat_id: int, template_str: str, **substitutio
     return await bot.send_message(chat_id, text, parse_mode='HTML')
 
 def save_media_template(message: types.Message) -> str:
-    """Сохраняет шаблон: медиа/пересылка/HTML-текст с entities."""
+    """Сохраняет шаблон: медиа/пересылка/HTML-текст."""
     if message.forward_from_chat and message.forward_from_message_id:
         return json.dumps({'type': 'forward', 'chat_id': message.forward_from_chat.id,
                            'message_id': message.forward_from_message_id})
     if message.photo:
         file_id = message.photo[-1].file_id
-        entities = []
-        if message.caption_entities:
-            entities = [ent.model_dump() for ent in message.caption_entities]
         return json.dumps({'type': 'media', 'media_type': 'photo', 'file_id': file_id,
-                           'caption': message.caption or '', 'entities': entities})
+                           'caption': message.caption or ''})
     if message.video:
-        entities = []
-        if message.caption_entities:
-            entities = [ent.model_dump() for ent in message.caption_entities]
         return json.dumps({'type': 'media', 'media_type': 'video', 'file_id': message.video.file_id,
-                           'caption': message.caption or '', 'entities': entities})
+                           'caption': message.caption or ''})
     if message.animation:
-        entities = []
-        if message.caption_entities:
-            entities = [ent.model_dump() for ent in message.caption_entities]
         return json.dumps({'type': 'media', 'media_type': 'animation', 'file_id': message.animation.file_id,
-                           'caption': message.caption or '', 'entities': entities})
+                           'caption': message.caption or ''})
     if message.document:
-        entities = []
-        if message.caption_entities:
-            entities = [ent.model_dump() for ent in message.caption_entities]
         return json.dumps({'type': 'media', 'media_type': 'document', 'file_id': message.document.file_id,
-                           'caption': message.caption or '', 'entities': entities})
+                           'caption': message.caption or ''})
     # Текст с HTML
     if message.text:
         return message.html_text
@@ -286,12 +269,11 @@ async def start_cmd(message: types.Message, bot: Bot, command: CommandObject = N
         if token:
             await handle_verify_token(message, bot, token)
             return
-    # Обычный пользователь – предлагаем проверку
     kb = InlineKeyboardBuilder()
     kb.button(text="🔍 Проверить розыгрыш", callback_data="verify_manual")
     await message.answer("ℹ️ Я бот для честных рулеток. Для проверки используйте ссылку из результатов розыгрыша или нажмите кнопку ниже.", reply_markup=kb.as_markup())
 
-# Альтернативная проверка для обычных пользователей
+# ---------- Альтернативная проверка ----------
 class VerifyForm(StatesGroup):
     waiting_for_seed = State()
     waiting_for_hash = State()
@@ -324,14 +306,12 @@ async def process_participants(message: types.Message, state: FSMContext):
     seed = data['seed']
     expected_hash = data['hash']
     participants = [p.strip() for p in message.text.strip().split('\n') if p.strip()]
-    # Проверяем хеш
     import hashlib
     computed_hash = hashlib.sha256(seed.encode()).hexdigest()
     if computed_hash != expected_hash:
         await message.answer("❌ Хеш не совпадает! Результаты могли быть подделаны.")
         await state.clear()
         return
-    # Генерируем победителей (нужно знать количество, спросим)
     await state.update_data(participants=participants, seed=seed)
     await message.answer("Введите количество победителей:")
     await state.set_state('waiting_winners_count')
@@ -348,13 +328,11 @@ async def process_winners_count(message: types.Message, state: FSMContext):
     if count > len(participants):
         await message.answer("Победителей больше, чем участников.")
         return
-    # Выбираем победителей
     rng = __import__('random').Random(data['seed'])
     indices = list(range(len(participants)))
     rng.shuffle(indices)
     winners = [participants[i] for i in indices[:count]]
-    # Выводим результат
-    report = f"🔒 Seed: <code>{data['seed']}</code>\n✅ Хеш совпадает!\n\n<b>Победители:</b>\n" + "\n".join(f"• {w}" for w in winners)
+    report = f"🔒 Seed: <code>{escape_html(data['seed'])}</code>\n✅ Хеш совпадает!\n\n<b>Победители:</b>\n" + "\n".join(f"• {escape_html(w)}" for w in winners)
     await message.answer(report, parse_mode='HTML')
     await state.clear()
 
@@ -415,27 +393,21 @@ async def roulette_cmd(message: types.Message, bot: Bot):
     else:
         await start_recording(bot, chat_id, rid)
 
-# ---------- Удаление триггеров до старта (в waiting_start) ----------
-@filter_router.message(lambda msg: msg.chat.id in active_sessions or get_roulette(msg.chat.id, 'waiting_start'))
+# ---------- Удаление триггеров до старта (НЕ МЕШАЕТ при активной сессии) ----------
+@filter_router.message(lambda msg: not (msg.chat.id in active_sessions) and get_roulette(msg.chat.id, 'waiting_start'))
 async def pre_start_filter(message: types.Message, bot: Bot):
     if message.chat.type == 'private':
         return
     chat_id = message.chat.id
     if await is_admin(bot, chat_id, message.from_user.id):
         return
-    # Если уже активна запись, обрабатывает основной фильтр, сюда не попадаем (проверим)
-    if chat_id in active_sessions:
-        return  # основная сессия активна, пропускаем
     roulette = get_roulette(chat_id, 'waiting_start')
     if not roulette:
         return
     trigger = roulette['trigger']
     text = message.text or message.caption or ''
     if text.strip().lower() == trigger.lower():
-        # Удаляем триггер
         await message.delete()
-        # Проверяем, не было ли уже уведомления этому пользователю
-        # Храним в словаре pre_warned (user_id -> message_id)
         if not hasattr(pre_start_filter, 'warned'):
             pre_start_filter.warned = {}
         prev_msg_id = pre_start_filter.warned.get(message.from_user.id)
@@ -444,10 +416,8 @@ async def pre_start_filter(message: types.Message, bot: Bot):
                 await bot.delete_message(chat_id, prev_msg_id)
             except:
                 pass
-        # Отправляем новое уведомление (с задержкой 2 сек)
         sent = await bot.send_message(chat_id, f"⏳ {message.from_user.full_name}, запись ещё не началась. Ожидайте старта.")
         pre_start_filter.warned[message.from_user.id] = sent.message_id
-        # Задержка 2 сек уже есть в очереди? Нет, используем asyncio.sleep(2) внутри send_message? Лучше просто отправить, т.к. частота низкая.
         await asyncio.sleep(2)
 
 # ---------- @отмена ----------
@@ -805,7 +775,7 @@ async def view_settings(call: types.CallbackQuery):
     await call.message.edit_text(s, reply_markup=back_btn(), parse_mode='HTML')
     await call.answer()
 
-# Обработчики меню (без изменений, экранирование уже внутри format_setting)
+# Обработчики меню (без изменений, с экранированием)
 @admin_router.callback_query(F.data == "set_chat")
 async def set_chat_start(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text("Введите ID чата (текущий: " +
@@ -1069,7 +1039,6 @@ async def handle_verify_token(message: types.Message, bot: Bot, token: str):
     seed = roulette.get('seed', 'не указан')
     seed_hash = roulette.get('seed_hash', 'не указан')
     start_time = parse_datetime(roulette['start_time']).strftime('%d.%m.%Y %H:%M') if roulette['start_time'] else '?'
-    # Готовый Python-код с подставленными данными
     participants_code = json.dumps(participants, ensure_ascii=False)
     python_code = (
         "import random\n"
