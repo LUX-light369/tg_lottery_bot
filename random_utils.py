@@ -51,7 +51,6 @@ def create_reroll_image(old_winners: List[int], crossed: List[int], new_winners:
     draw.text((W/2, y), "Предыдущий результат:", fill=white, font=font_small, anchor="mm")
     y += 30
     old_text = ", ".join(str(n) for n in old_winners)
-    # Зачёркиваем лишённых (визуально не сделать, просто отметим)
     if crossed:
         crossed_set = set(crossed)
         parts = []
@@ -101,31 +100,31 @@ def _create_base_image(winners: List[int], total: int, dt: datetime, seed_hash: 
     # Заголовок
     draw.text((W/2, 70), title, fill=accent, font=font_title, anchor="mm")
 
-    # Номера победителей (адаптивный шрифт и перенос)
+    # Номера победителей (адаптивный шрифт)
     max_font_size = 80
     min_font_size = 20
     winners_text = ", ".join(str(w) for w in winners)
 
-    # Подбираем размер шрифта
+    font_winners = None
     for size in range(max_font_size, min_font_size - 1, -10):
         try:
             font_winners = ImageFont.truetype("DejaVuSans-Bold.ttf", size)
         except:
             font_winners = ImageFont.load_default()
-        # Оцениваем ширину текста с помощью textbbox (Pillow >= 8.0)
         bbox = draw.textbbox((0, 0), winners_text, font=font_winners)
         text_width = bbox[2] - bbox[0]
         if text_width <= W - 40:
             break
     else:
-        # Если не помещается, переносим на несколько строк
+        # Не поместилось ни с одним шрифтом — будем переносить
         lines = _wrap_text(winners_text, font_winners, W - 40, draw)
         y = 200
-        line_height = draw.textbbox((0,0), "A", font=font_winners)[3] - draw.textbbox((0,0), "A", font=font_winners)[1]
+        line_height = draw.textbbox((0, 0), "A", font=font_winners)[3] - draw.textbbox((0, 0), "A", font=font_winners)[1]
         for line in lines:
             draw.text((W/2, y), line, fill=white, font=font_winners, anchor="mm")
             y += line_height + 10
     else:
+        # Если нашли размер, рисуем одной строкой
         draw.text((W/2, 200), winners_text, fill=white, font=font_winners, anchor="mm")
 
     draw.text((W/2, 300), f"Участников: 1 – {total}", fill=white, font=font_info, anchor="mm")
@@ -145,7 +144,7 @@ def _wrap_text(text: str, font, max_width: int, draw) -> List[str]:
     current_line = ""
     for word in words:
         test_line = f"{current_line}, {word}" if current_line else word
-        bbox = draw.textbbox((0,0), test_line, font=font)
+        bbox = draw.textbbox((0, 0), test_line, font=font)
         if bbox[2] - bbox[0] <= max_width:
             current_line = test_line
         else:
