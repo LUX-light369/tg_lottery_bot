@@ -105,6 +105,7 @@ def _create_base_image(winners: List[int], total: int, dt: datetime, seed_hash: 
     min_font_size = 20
     winners_text = ", ".join(str(w) for w in winners)
 
+    # Подбираем размер шрифта
     font_winners = None
     for size in range(max_font_size, min_font_size - 1, -10):
         try:
@@ -116,7 +117,7 @@ def _create_base_image(winners: List[int], total: int, dt: datetime, seed_hash: 
         if text_width <= W - 40:
             break
     else:
-        # Не поместилось ни с одним шрифтом — будем переносить
+        # Если цикл завершился без break — текст не помещается, переносим на несколько строк
         lines = _wrap_text(winners_text, font_winners, W - 40, draw)
         y = 200
         line_height = draw.textbbox((0, 0), "A", font=font_winners)[3] - draw.textbbox((0, 0), "A", font=font_winners)[1]
@@ -124,7 +125,7 @@ def _create_base_image(winners: List[int], total: int, dt: datetime, seed_hash: 
             draw.text((W/2, y), line, fill=white, font=font_winners, anchor="mm")
             y += line_height + 10
     else:
-        # Если нашли размер, рисуем одной строкой
+        # Если нашли подходящий размер, рисуем одной строкой
         draw.text((W/2, 200), winners_text, fill=white, font=font_winners, anchor="mm")
 
     draw.text((W/2, 300), f"Участников: 1 – {total}", fill=white, font=font_info, anchor="mm")
