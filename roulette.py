@@ -25,7 +25,8 @@ from database import (
 )
 from random_utils import (
     generate_seed_hash, select_winners,
-    create_result_image, create_random_image, get_verification_instruction
+    create_result_image, create_random_image, create_reroll_image,
+    get_verification_instruction
 )
 
 NOVOSIBIRSK = pytz.timezone('Asia/Novosibirsk')
@@ -275,13 +276,12 @@ async def start_cmd(message: types.Message, bot: Bot, command: CommandObject = N
         if token:
             await handle_verify_token(message, bot, token)
             return
-    # Обычный пользователь – reply‑клавиатура с проверкой
     await message.answer(
         "ℹ️ Я бот для честных рулеток. Для проверки результата нажмите кнопку ниже или используйте ссылку.",
         reply_markup=user_reply_kb()
     )
 
-# ---------- Обработка нажатия reply‑кнопки ----------
+# ---------- Обработка reply‑кнопки ----------
 @admin_router.message(lambda msg: msg.chat.type == 'private' and msg.text == "🔍 Проверить результат")
 async def manual_verify_start(message: types.Message, state: FSMContext):
     if message.from_user.id == MAIN_ADMIN_ID:
@@ -305,7 +305,10 @@ async def process_seed(message: types.Message, state: FSMContext):
 @admin_router.message(StateFilter(VerifyForm.waiting_for_hash))
 async def process_hash(message: types.Message, state: FSMContext):
     await state.update_data(hash=message.text.strip())
-    await message.answer("Введите список участников (каждый с новой строки, в порядке записи):")
+    await message.answer(
+        "Введите список участников (каждый с новой строки, в порядке записи).\n"
+        "Если это рандом, введите диапазон чисел, например: 1-90"
+    )
     await state.set_state(VerifyForm.waiting_for_participants)
 
 @admin_router.message(StateFilter(VerifyForm.waiting_for_participants))
@@ -313,7 +316,15 @@ async def process_participants(message: types.Message, state: FSMContext):
     data = await state.get_data()
     seed = data['seed']
     expected_hash = data['hash']
-    participants = [p.strip() for p in message.text.strip().split('\n') if p.strip()]
+    text = message.text.strip()
+    # Определяем, диапазон или список
+    participants = []
+    if re.match(r'^\d+-\d+$', text):
+        lo, hi = map(int, text.split('-'))
+        participants = list(range(lo, hi+1))
+    else:
+        participants = [p.strip() for p in text.split('\n') if p.strip()]
+
     import hashlib
     computed_hash = hashlib.sha256(seed.encode()).hexdigest()
     if computed_hash != expected_hash:
@@ -340,7 +351,7 @@ async def process_winners_count(message: types.Message, state: FSMContext):
     indices = list(range(len(participants)))
     rng.shuffle(indices)
     winners = [participants[i] for i in indices[:count]]
-    report = f"🔒 Seed: <code>{escape_html(data['seed'])}</code>\n✅ Хеш совпадает!\n\n<b>Победители:</b>\n" + "\n".join(f"• {escape_html(w)}" for w in winners)
+    report = f"🔒 Seed: <code>{escape_html(data['seed'])}</code>\n✅ Хеш совпадает!\n\n<b>Победители:</b>\n" + "\n".join(f"• {escape_html(str(w))}" for w in winners)
     await message.answer(report, parse_mode='HTML', reply_markup=user_reply_kb())
     await state.clear()
 
@@ -382,7 +393,6 @@ async def roulette_cmd(message: types.Message, bot: Bot):
                         get_setting('start_msg'), get_setting('stop_msg'),
                         get_setting('result_msg'), start_time, stop_time,
                         seed=seed, seed_hash=seed_hash, verify_token=verify_token)
-    # Обрезаем призы под количество победителей
     if winners and prizes_list:
         prizes_list = prizes_list[:winners]
     announce = (
@@ -395,13 +405,12 @@ async def roulette_cmd(message: types.Message, bot: Bot):
     if prizes_list:
         announce += "\n<b>Призы:</b>\n" + "\n".join(f"• {p}" for p in prizes_list)
     enqueue(chat_id, 'send_message', text=announce, parse_mode='HTML')
-    # Правила после анонса убраны, останутся только перед стартом
     if start_time > now:
         asyncio.create_task(schedule_start(bot, chat_id, rid, (start_time - now).total_seconds()))
     else:
         await start_recording(bot, chat_id, rid)
 
-# ---------- Удаление триггеров до старта (НЕ МЕШАЕТ при активной сессии) ----------
+# ---------- Удаление триггеров до старта ----------
 @filter_router.message(lambda msg: not (msg.chat.id in active_sessions) and get_roulette(msg.chat.id, 'waiting_start'))
 async def pre_start_filter(message: types.Message, bot: Bot):
     if message.chat.type == 'private':
@@ -480,10 +489,13 @@ async def random_cmd(message: types.Message, bot: Bot):
     await bot.send_photo(chat_id, photo=img_file)
     verify_link = f"https://t.me/{BOT_USERNAME}?start={verify_token}"
     enqueue(chat_id, 'send_message', text=f"🔒 Хеш: <code>{seed_hash}</code>\nSeed: <code>{seed}</code>\n🔍 Проверка: {verify_link}", parse_mode='HTML', disable_web_page_preview=True)
-    save_roulette(chat_id, 'finished', 0, winners_count,
-                  '', '', '', '', '', '', datetime.now(NOVOSIBIRSK), datetime.now(NOVOSIBIRSK),
-                  seed=seed, seed_hash=seed_hash, verify_token=verify_token,
-                  participants_json=json.dumps(numbers), winners_json=json.dumps([numbers.index(w) for w in winners]))
+    # Сохраняем рулетку без participants/winners в самом INSERT
+    rid = save_roulette(chat_id, 'finished', 0, winners_count,
+                        '', '', '', '', '', '', datetime.now(NOVOSIBIRSK), datetime.now(NOVOSIBIRSK),
+                        seed=seed, seed_hash=seed_hash, verify_token=verify_token)
+    # Обновляем запись с participants и winners
+    update_roulette(rid, participants_json=json.dumps(numbers),
+                    winners_json=json.dumps([numbers.index(w) for w in winners]))
 
 # ---------- @перекрут ----------
 @admin_router.message(F.text.regexp(r'@перекрут\s+(.+)'))
@@ -531,10 +543,20 @@ async def reroll_cmd(message: types.Message, bot: Bot):
             names.append(str(uid))
     winner_numbers_old = [i+1 for i in winners_idx]
     winner_numbers_new = [i+1 for i in final_winners]
-    img_bytes_old = create_result_image(winner_numbers_old, len(participants), parse_datetime(last['stop_time']), last['seed_hash'])
-    img_file_old = BufferedInputFile(img_bytes_old.read(), filename="old.png")
-    img_bytes_new = create_result_image(winner_numbers_new, len(participants), datetime.now(NOVOSIBIRSK), seed_hash)
-    img_file_new = BufferedInputFile(img_bytes_new.read(), filename="new.png")
+    # Определяем, какие старые номера лишены призов (те, что перекручены)
+    lost_numbers = [winner_numbers_old[n-1] for n in reroll]
+    # Создаём одну картинку перекрута
+    img_bytes = create_reroll_image(
+        old_winners=winner_numbers_old,
+        crossed=lost_numbers,
+        new_winners=winner_numbers_new,
+        total=len(participants),
+        old_dt=parse_datetime(last['stop_time']),
+        new_dt=datetime.now(NOVOSIBIRSK),
+        old_hash=last['seed_hash'],
+        new_hash=seed_hash
+    )
+    img_file = BufferedInputFile(img_bytes.read(), filename="reroll.png")
     prizes_raw = last['prizes'] or ''
     prizes_list = [p.strip() for p in prizes_raw.split('\n') if p.strip()] if prizes_raw else []
     new_winners_lines = []
@@ -542,11 +564,11 @@ async def reroll_cmd(message: types.Message, bot: Bot):
         name = names[idx] if idx < len(names) else str(participants[idx])
         prize = prizes_list[i] if i < len(prizes_list) else "не указан"
         uid_str = participants[idx]
-        new_winners_lines.append(f"{name} ({prize})\n#id{uid_str}")
+        new_winners_lines.append(f"{name} ({prize})\n#id{uid_str}\n")
     caption_text = "\n".join(new_winners_lines)
     if old_names:
         crossed = ", ".join(f"<s>{n}</s>" for n in old_names)
-        caption_text += f"\n\nЛишились призов: {crossed}"
+        caption_text += f"\nЛишились призов: {crossed}"
     result_template = last['result_msg']
     try:
         tmpl_data = json.loads(result_template)
@@ -559,11 +581,7 @@ async def reroll_cmd(message: types.Message, bot: Bot):
         full_caption = result_template.replace('{winners}', caption_text)
     if len(full_caption) > 1024:
         full_caption = full_caption[:1020] + "..."
-    media = [
-        InputMediaPhoto(media=img_file_old, caption=full_caption, parse_mode='HTML'),
-        InputMediaPhoto(media=img_file_new)
-    ]
-    await bot.send_media_group(chat_id, media=media)
+    await bot.send_photo(chat_id, photo=img_file, caption=full_caption, parse_mode='HTML')
     verify_link = f"https://t.me/{BOT_USERNAME}?start={verify_token}"
     enqueue(chat_id, 'send_message', text=f"🔒 Хеш: <code>{seed_hash}</code>\nSeed: <code>{seed}</code>\n🔍 Проверка: {verify_link}", parse_mode='HTML', disable_web_page_preview=True)
     new_id = save_roulette(chat_id, 'finished', last['duration'], len(final_winners),
@@ -582,13 +600,11 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     roulette = get_roulette_by_id(rid)
     if not roulette or roulette['status'] != 'waiting_start':
         return
-    # Правила только перед стартом
     rules = roulette['rules']
     if rules:
         await send_template(bot, chat_id, rules, trigger=roulette['trigger'],
                             duration=str(roulette['duration']), seed_hash=roulette.get('seed_hash',''))
         await asyncio.sleep(2)
-    # Стартовое сообщение
     start = roulette['start_msg']
     if start:
         await send_template(bot, chat_id, start, trigger=roulette['trigger'])
@@ -601,7 +617,6 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     delay = (stop_time - datetime.now(NOVOSIBIRSK)).total_seconds()
     if delay > 0:
         await asyncio.sleep(delay)
-    # Стоп-сообщение
     stop = roulette['stop_msg']
     if stop:
         await send_template(bot, chat_id, stop)
@@ -643,7 +658,7 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
         for i, uid in enumerate(winners):
             name = wnames_with_at[i]
             prize = prizes_list[i] if i < len(prizes_list) else "не указан"
-            winners_lines.append(f"{name} ({prize})\n#id{uid}")
+            winners_lines.append(f"{name} ({prize})\n#id{uid}\n")
         wstr = "\n".join(winners_lines)
         result_template = roulette['result_msg']
         try:
