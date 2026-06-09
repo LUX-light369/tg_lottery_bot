@@ -25,7 +25,7 @@ from database import (
 )
 from random_utils import (
     generate_seed_hash, select_winners,
-    create_result_image, create_random_image, create_reroll_images,
+    create_result_image, create_random_image,
     get_verification_instruction
 )
 
@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 MAIN_ADMIN_ID = None
 BOT_USERNAME = None
-scheduled_tasks: Dict[int, asyncio.Task] = {}  # roulette_id -> task
+scheduled_tasks: Dict[int, asyncio.Task] = {}
 
 def set_bot_username(username: str):
     global BOT_USERNAME
@@ -395,18 +395,25 @@ async def roulette_cmd(message: types.Message, bot: Bot):
                         get_setting('result_msg'), start_time, stop_time,
                         seed=seed, seed_hash=seed_hash, verify_token=verify_token)
 
-    # Обрезаем призы под количество победителей для анонса
+    # Анонс через шаблон
+    announce_template = get_setting('announce_msg')
+    if not announce_template:
+        announce_template = (
+            "📢 <b>Рулетка</b>\n"
+            "Победителей: ${winners}\n"
+            "Длительность: ${duration} мин.\n"
+            "Старт: ${start_time} (НСК)\n"
+            "🔒 Хеш честности: <code>${seed_hash}</code>"
+            "${prizes}"
+        )
     display_prizes = prizes_list[:winners] if winners and prizes_list else prizes_list
-    announce = (
-        f"📢 <b>Рулетка</b>\n"
-        f"Победителей: {winners if winners else 'определит админ'}\n"
-        f"Длительность: {duration} мин.\n"
-        f"Старт: {start_time.strftime('%d.%m.%Y %H:%M')} (НСК)\n"
-        f"🔒 Хеш честности: <code>{seed_hash}</code>"
-    )
-    if display_prizes:
-        announce += "\n<b>Призы:</b>\n" + "\n".join(f"• {p}" for p in display_prizes)
-    enqueue(chat_id, 'send_message', text=announce, parse_mode='HTML')
+    prizes_str = "\n<b>Призы:</b>\n" + "\n".join(f"• {p}" for p in display_prizes) if display_prizes else ""
+    await send_template(bot, chat_id, announce_template,
+                        winners=str(winners) if winners else "определит админ",
+                        duration=str(duration),
+                        start_time=start_time.strftime('%d.%m.%Y %H:%M'),
+                        seed_hash=seed_hash,
+                        prizes=prizes_str)
 
     if start_time > now:
         task = asyncio.create_task(schedule_start(bot, chat_id, rid, (start_time - now).total_seconds()))
@@ -449,7 +456,6 @@ async def cancel_cmd(message: types.Message, bot: Bot):
     chat_id = message.chat.id
     session = active_sessions.pop(chat_id, None)
     if session:
-        # Отменяем активную запись без стоп-сообщения
         update_roulette(session.roulette_id, status='cancelled')
         enqueue(chat_id, 'send_message', text="❌ Рулетка отменена.")
         return
@@ -457,7 +463,6 @@ async def cancel_cmd(message: types.Message, bot: Bot):
     roulette = get_roulette(chat_id, 'waiting_start')
     if roulette:
         rid = roulette['id']
-        # Отменяем запланированную задачу, если есть
         task = scheduled_tasks.pop(rid, None)
         if task and not task.done():
             task.cancel()
@@ -552,19 +557,12 @@ async def reroll_cmd(message: types.Message, bot: Bot):
             names.append(str(uid))
     winner_numbers_old = [i+1 for i in winners_idx]
     winner_numbers_new = [i+1 for i in final_winners]
-    # Лишённые призов — те номера, которые перекрутили
-    lost_numbers = [winner_numbers_old[n-1] for n in reroll]
-    # Генерируем две картинки
-    img_bytes_old, img_bytes_new = create_reroll_images(
-        old_winners=winner_numbers_old,
-        crossed=lost_numbers,
-        new_winners=winner_numbers_new,
-        total=len(participants),
-        old_dt=parse_datetime(last['stop_time']),
-        new_dt=datetime.now(NOVOSIBIRSK),
-        old_hash=last['seed_hash'],
-        new_hash=seed_hash
-    )
+
+    # Генерируем две картинки в едином стиле (без зачёркиваний)
+    img_bytes_old = create_result_image(winner_numbers_old, len(participants),
+                                        parse_datetime(last['stop_time']), last['seed_hash'])
+    img_bytes_new = create_result_image(winner_numbers_new, len(participants),
+                                        datetime.now(NOVOSIBIRSK), seed_hash)
     img_file_old = BufferedInputFile(img_bytes_old.read(), filename="old.png")
     img_file_new = BufferedInputFile(img_bytes_new.read(), filename="new.png")
 
@@ -575,7 +573,7 @@ async def reroll_cmd(message: types.Message, bot: Bot):
         name = names[idx] if idx < len(names) else str(participants[idx])
         prize = prizes_list[i] if i < len(prizes_list) else "не указан"
         uid_str = participants[idx]
-        new_winners_lines.append(f"{name} ({prize})\n#id{uid_str}\n")
+        new_winners_lines.append(f"🏅 {name} ({prize})\n#id{uid_str}\n")
     caption_text = "\n".join(new_winners_lines)
     if old_names:
         crossed = ", ".join(f"<s>{n}</s>" for n in old_names)
@@ -594,7 +592,7 @@ async def reroll_cmd(message: types.Message, bot: Bot):
     if len(full_caption) > 1024:
         full_caption = full_caption[:1020] + "..."
 
-    # Отправляем две картинки с общей подписью
+    # Отправляем две картинки (первая с подписью)
     media = [
         InputMediaPhoto(media=img_file_old, caption=full_caption, parse_mode='HTML'),
         InputMediaPhoto(media=img_file_new)
@@ -619,7 +617,6 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     roulette = get_roulette_by_id(rid)
     if not roulette or roulette['status'] != 'waiting_start':
         return
-    # Убираем задачу из словаря (если была запланирована)
     scheduled_tasks.pop(rid, None)
 
     rules = roulette['rules']
@@ -667,7 +664,10 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
         await bot.send_message(MAIN_ADMIN_ID, f"Список участников чата {chat_id}:\n{participants_str_with_at}")
     except:
         pass
+
     if roulette['winners_count'] > 0:
+        # Задержка перед результатом
+        await asyncio.sleep(2)
         seed = roulette['seed']
         winners = select_winners(valid_users, roulette['winners_count'], seed)
         winner_numbers = [valid_users.index(u)+1 for u in winners]
@@ -680,7 +680,7 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
         for i, uid in enumerate(winners):
             name = wnames_with_at[i]
             prize = prizes_list[i] if i < len(prizes_list) else "не указан"
-            winners_lines.append(f"{name} ({prize})\n#id{uid}\n")
+            winners_lines.append(f"🏅 {name} ({prize})\n#id{uid}\n")
         wstr = "\n".join(winners_lines)
         result_template = roulette['result_msg']
         try:
@@ -762,6 +762,7 @@ class SettingsForm(StatesGroup):
     waiting_for_start_msg = State()
     waiting_for_stop_msg = State()
     waiting_for_result_msg = State()
+    waiting_for_announce_msg = State()
     waiting_for_channel_add = State()
     waiting_for_channel_del = State()
     waiting_for_ban = State()
@@ -778,6 +779,7 @@ def build_menu_kb():
     kb.button(text="🚀 Старт", callback_data="set_start_msg")
     kb.button(text="⏹ Стоп", callback_data="set_stop_msg")
     kb.button(text="📝 Пост победителей", callback_data="set_result_msg")
+    kb.button(text="📢 Анонс", callback_data="set_announce_msg")
     kb.button(text="💬 Каналы подписки", callback_data="channels_menu")
     kb.button(text="🚫 Баны", callback_data="ban_menu")
     kb.button(text="👥 Макс. участников", callback_data="set_max")
@@ -814,10 +816,12 @@ async def view_settings(call: types.CallbackQuery):
 Правила: {format_setting(get_setting('rules'))}
 Старт: {format_setting(get_setting('start_msg'))}
 Стоп: {format_setting(get_setting('stop_msg'))}
-Результат: {format_setting(get_setting('result_msg'))}"""
+Результат: {format_setting(get_setting('result_msg'))}
+Анонс: {format_setting(get_setting('announce_msg'))}"""
     await call.message.edit_text(s, reply_markup=back_btn(), parse_mode='HTML')
     await call.answer()
 
+# ---------- Обработчики настроек ----------
 @admin_router.callback_query(F.data == "set_chat")
 async def set_chat_start(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text("Введите ID чата (текущий: " +
@@ -939,6 +943,24 @@ async def set_result_msg_finish(message: types.Message, state: FSMContext):
     data = save_media_template(message)
     set_setting('result_msg', data)
     await message.answer("Пост победителей сохранён.", reply_markup=back_btn())
+    await state.clear()
+
+@admin_router.callback_query(F.data == "set_announce_msg")
+async def set_announce_msg_start(call: types.CallbackQuery, state: FSMContext):
+    await call.message.edit_text(
+        "Отправьте шаблон анонса (можно использовать переменные:\n"
+        "${winners}, ${duration}, ${start_time}, ${seed_hash}, ${prizes})\n"
+        "или перешлите медиа с подписью.",
+        reply_markup=back_btn()
+    )
+    await state.set_state(SettingsForm.waiting_for_announce_msg)
+    await call.answer()
+
+@admin_router.message(StateFilter(SettingsForm.waiting_for_announce_msg))
+async def set_announce_msg_finish(message: types.Message, state: FSMContext):
+    data = save_media_template(message)
+    set_setting('announce_msg', data)
+    await message.answer("Анонс сохранён.", reply_markup=back_btn())
     await state.clear()
 
 @admin_router.callback_query(F.data == "channels_menu")
