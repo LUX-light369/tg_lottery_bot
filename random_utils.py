@@ -22,17 +22,19 @@ def create_result_image(winners: List[int], total: int, dt: datetime, seed_hash:
 def create_random_image(winners: List[int], lo: int, hi: int, dt: datetime, seed_hash: str) -> io.BytesIO:
     return _create_base_image(winners, hi - lo + 1, dt, seed_hash, "СЛУЧАЙНЫЕ ЧИСЛА")
 
-def create_reroll_image(old_winners: List[int], crossed: List[int], new_winners: List[int],
-                        total: int, old_dt: datetime, new_dt: datetime,
-                        old_hash: str, new_hash: str) -> io.BytesIO:
+def create_reroll_images(old_winners: List[int], crossed: List[int], new_winners: List[int],
+                         total: int, old_dt: datetime, new_dt: datetime,
+                         old_hash: str, new_hash: str) -> Tuple[io.BytesIO, io.BytesIO]:
+    """Возвращает две картинки: старый результат и новый."""
     W, H = 800, 700
     bg = (15, 15, 35)
     accent = (255, 215, 0)
     white = (255, 255, 255)
     grey = (128, 128, 128)
 
-    img = Image.new('RGB', (W, H), bg)
-    draw = ImageDraw.Draw(img)
+    # Старая картинка
+    img_old = Image.new('RGB', (W, H), bg)
+    draw = ImageDraw.Draw(img_old)
 
     try:
         font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", 40)
@@ -43,41 +45,55 @@ def create_reroll_image(old_winners: List[int], crossed: List[int], new_winners:
         font_numbers = ImageFont.load_default()
         font_small = ImageFont.load_default()
 
-    # Заголовок
-    draw.text((W/2, 30), "ПЕРЕКРУТ РУЛЕТКИ", fill=accent, font=font_title, anchor="mm")
-
+    draw.text((W/2, 30), "ПРЕДЫДУЩИЙ РЕЗУЛЬТАТ", fill=accent, font=font_title, anchor="mm")
     y = 80
-    # Старые победители
-    draw.text((W/2, y), "Предыдущий результат:", fill=white, font=font_small, anchor="mm")
+    draw.text((W/2, y), "Победители:", fill=white, font=font_small, anchor="mm")
     y += 30
-    old_text = ", ".join(str(n) for n in old_winners)
-    if crossed:
-        crossed_set = set(crossed)
-        parts = []
-        for n in old_winners:
-            parts.append(f"<s>{n}</s>" if n in crossed_set else str(n))
-        old_text = ", ".join(parts)
+    old_text = _format_numbers(old_winners, crossed)
     draw.text((W/2, y), old_text, fill=grey, font=font_numbers, anchor="mm")
     y += 50
     draw.text((W/2, y), f"Дата: {old_dt.strftime('%d.%m.%Y %H:%M')} (НСК)  Хеш: {old_hash[:16]}...", fill=grey, font=font_small, anchor="mm")
-    y += 50
+    draw.rectangle([20, 20, W-20, H-20], outline=accent, width=3)
 
-    # Новые победители
-    draw.text((W/2, y), "Новый результат:", fill=accent, font=font_small, anchor="mm")
+    buf_old = io.BytesIO()
+    img_old.save(buf_old, format='PNG')
+    buf_old.seek(0)
+
+    # Новая картинка
+    img_new = Image.new('RGB', (W, H), bg)
+    draw = ImageDraw.Draw(img_new)
+
+    draw.text((W/2, 30), "НОВЫЙ РЕЗУЛЬТАТ", fill=accent, font=font_title, anchor="mm")
+    y = 80
+    draw.text((W/2, y), "Победители:", fill=white, font=font_small, anchor="mm")
     y += 30
     new_text = ", ".join(str(n) for n in new_winners)
     draw.text((W/2, y), new_text, fill=white, font=font_numbers, anchor="mm")
     y += 50
     draw.text((W/2, y), f"Дата: {new_dt.strftime('%d.%m.%Y %H:%M')} (НСК)  Хеш: {new_hash[:16]}...", fill=white, font=font_small, anchor="mm")
-    y += 50
-
-    draw.text((W/2, y), f"Участников: 1 – {total}", fill=white, font=font_small, anchor="mm")
     draw.rectangle([20, 20, W-20, H-20], outline=accent, width=3)
 
-    buf = io.BytesIO()
-    img.save(buf, format='PNG')
-    buf.seek(0)
-    return buf
+    buf_new = io.BytesIO()
+    img_new.save(buf_new, format='PNG')
+    buf_new.seek(0)
+
+    return buf_old, buf_new
+
+def _format_numbers(numbers: List[int], crossed: List[int] = None) -> str:
+    """Форматирует числа с учётом зачёркивания и переноса строк (>7)."""
+    if crossed is None:
+        crossed = []
+    crossed_set = set(crossed)
+    parts = []
+    for n in numbers:
+        parts.append(f"<s>{n}</s>" if n in crossed_set else str(n))
+    if len(parts) <= 7:
+        return ", ".join(parts)
+    # Разбиваем на две строки
+    mid = (len(parts) + 1) // 2
+    line1 = ", ".join(parts[:mid])
+    line2 = ", ".join(parts[mid:])
+    return f"{line1}\n{line2}"
 
 def _create_base_image(winners: List[int], total: int, dt: datetime, seed_hash: str, title: str) -> io.BytesIO:
     W, H = 800, 600
@@ -97,36 +113,35 @@ def _create_base_image(winners: List[int], total: int, dt: datetime, seed_hash: 
         font_info = ImageFont.load_default()
         font_small = ImageFont.load_default()
 
-    # Заголовок
     draw.text((W/2, 70), title, fill=accent, font=font_title, anchor="mm")
 
-    # Номера победителей (адаптивный шрифт)
+    # Форматируем номера с переносом, если >7
+    winners_text = _format_numbers(winners)
     max_font_size = 80
     min_font_size = 20
-    winners_text = ", ".join(str(w) for w in winners)
-
-    # Подбираем размер шрифта
     font_winners = None
+    fit_single_line = False
+
     for size in range(max_font_size, min_font_size - 1, -10):
         try:
             font_winners = ImageFont.truetype("DejaVuSans-Bold.ttf", size)
         except:
             font_winners = ImageFont.load_default()
         bbox = draw.textbbox((0, 0), winners_text, font=font_winners)
-        text_width = bbox[2] - bbox[0]
-        if text_width <= W - 40:
+        if bbox[2] - bbox[0] <= W - 40:
+            fit_single_line = True
             break
+
+    if fit_single_line:
+        draw.text((W/2, 200), winners_text, fill=white, font=font_winners, anchor="mm")
     else:
-        # Если цикл завершился без break — текст не помещается, переносим на несколько строк
+        # Перенос по строкам, если даже с минимальным шрифтом не влезает
         lines = _wrap_text(winners_text, font_winners, W - 40, draw)
         y = 200
         line_height = draw.textbbox((0, 0), "A", font=font_winners)[3] - draw.textbbox((0, 0), "A", font=font_winners)[1]
         for line in lines:
             draw.text((W/2, y), line, fill=white, font=font_winners, anchor="mm")
             y += line_height + 10
-    else:
-        # Если нашли подходящий размер, рисуем одной строкой
-        draw.text((W/2, 200), winners_text, fill=white, font=font_winners, anchor="mm")
 
     draw.text((W/2, 300), f"Участников: 1 – {total}", fill=white, font=font_info, anchor="mm")
     time_str = dt.strftime("%d.%m.%Y %H:%M:%S") + " (НСК)"
