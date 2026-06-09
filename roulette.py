@@ -25,7 +25,7 @@ from database import (
 )
 from random_utils import (
     generate_seed_hash, select_winners,
-    create_result_image, create_random_image, create_reroll_image,
+    create_result_image, create_random_image, create_reroll_images,
     get_verification_instruction
 )
 
@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 MAIN_ADMIN_ID = None
 BOT_USERNAME = None
+scheduled_tasks: Dict[int, asyncio.Task] = {}  # roulette_id -> task
 
 def set_bot_username(username: str):
     global BOT_USERNAME
@@ -111,7 +112,6 @@ def substitute(template: str, **kwargs) -> str:
     return template
 
 async def send_template(bot: Bot, chat_id: int, template_str: str, **substitutions) -> types.Message:
-    """Отправляет шаблон с поддержкой HTML и медиа. Теперь для медиа включён parse_mode='HTML'."""
     try:
         data = json.loads(template_str)
         if isinstance(data, dict):
@@ -140,12 +140,10 @@ async def send_template(bot: Bot, chat_id: int, template_str: str, **substitutio
                 return await bot.send_message(chat_id, text, parse_mode='HTML')
     except:
         pass
-    # Обычный текст
     text = substitute(template_str, **substitutions)
     return await bot.send_message(chat_id, text, parse_mode='HTML')
 
 def save_media_template(message: types.Message) -> str:
-    """Сохраняет шаблон: медиа/пересылка/HTML-текст."""
     if message.forward_from_chat and message.forward_from_message_id:
         return json.dumps({'type': 'forward', 'chat_id': message.forward_from_chat.id,
                            'message_id': message.forward_from_message_id})
@@ -162,13 +160,11 @@ def save_media_template(message: types.Message) -> str:
     if message.document:
         return json.dumps({'type': 'media', 'media_type': 'document', 'file_id': message.document.file_id,
                            'caption': message.caption or ''})
-    # Текст с HTML
     if message.text:
         return message.html_text
     return message.text or ''
 
 def format_setting(value: str) -> str:
-    """Безопасное отображение в HTML (экранирование)."""
     try:
         data = json.loads(value)
         if isinstance(data, dict):
@@ -317,7 +313,6 @@ async def process_participants(message: types.Message, state: FSMContext):
     seed = data['seed']
     expected_hash = data['hash']
     text = message.text.strip()
-    # Определяем, диапазон или список
     participants = []
     if re.match(r'^\d+-\d+$', text):
         lo, hi = map(int, text.split('-'))
@@ -377,6 +372,12 @@ async def roulette_cmd(message: types.Message, bot: Bot):
     trigger = get_setting('trigger') or '+'
     prizes_raw = get_setting('prizes') or ''
     prizes_list = [p.strip() for p in prizes_raw.split('\n') if p.strip()] if prizes_raw else []
+
+    # Проверка достаточности призов
+    if winners and prizes_list and len(prizes_list) < winners:
+        await message.reply(f"❌ Недостаточно призов! Указано {len(prizes_list)} призов, а победителей {winners}.")
+        return
+
     now = datetime.now(NOVOSIBIRSK)
     if time_str:
         h, m = map(int, time_str.split(':'))
@@ -393,8 +394,9 @@ async def roulette_cmd(message: types.Message, bot: Bot):
                         get_setting('start_msg'), get_setting('stop_msg'),
                         get_setting('result_msg'), start_time, stop_time,
                         seed=seed, seed_hash=seed_hash, verify_token=verify_token)
-    if winners and prizes_list:
-        prizes_list = prizes_list[:winners]
+
+    # Обрезаем призы под количество победителей для анонса
+    display_prizes = prizes_list[:winners] if winners and prizes_list else prizes_list
     announce = (
         f"📢 <b>Рулетка</b>\n"
         f"Победителей: {winners if winners else 'определит админ'}\n"
@@ -402,11 +404,13 @@ async def roulette_cmd(message: types.Message, bot: Bot):
         f"Старт: {start_time.strftime('%d.%m.%Y %H:%M')} (НСК)\n"
         f"🔒 Хеш честности: <code>{seed_hash}</code>"
     )
-    if prizes_list:
-        announce += "\n<b>Призы:</b>\n" + "\n".join(f"• {p}" for p in prizes_list)
+    if display_prizes:
+        announce += "\n<b>Призы:</b>\n" + "\n".join(f"• {p}" for p in display_prizes)
     enqueue(chat_id, 'send_message', text=announce, parse_mode='HTML')
+
     if start_time > now:
-        asyncio.create_task(schedule_start(bot, chat_id, rid, (start_time - now).total_seconds()))
+        task = asyncio.create_task(schedule_start(bot, chat_id, rid, (start_time - now).total_seconds()))
+        scheduled_tasks[rid] = task
     else:
         await start_recording(bot, chat_id, rid)
 
@@ -445,15 +449,22 @@ async def cancel_cmd(message: types.Message, bot: Bot):
     chat_id = message.chat.id
     session = active_sessions.pop(chat_id, None)
     if session:
-        enqueue(chat_id, 'send_message', text="❌ Рулетка отменена.")
+        # Отменяем активную запись без стоп-сообщения
         update_roulette(session.roulette_id, status='cancelled')
+        enqueue(chat_id, 'send_message', text="❌ Рулетка отменена.")
+        return
+
+    roulette = get_roulette(chat_id, 'waiting_start')
+    if roulette:
+        rid = roulette['id']
+        # Отменяем запланированную задачу, если есть
+        task = scheduled_tasks.pop(rid, None)
+        if task and not task.done():
+            task.cancel()
+        update_roulette(rid, status='cancelled')
+        enqueue(chat_id, 'send_message', text="❌ Запланированная рулетка отменена.")
     else:
-        roulette = get_roulette(chat_id, 'waiting_start')
-        if roulette:
-            update_roulette(roulette['id'], status='cancelled')
-            enqueue(chat_id, 'send_message', text="❌ Запланированная рулетка отменена.")
-        else:
-            enqueue(chat_id, 'send_message', text="Нет активных рулеток для отмены.")
+        enqueue(chat_id, 'send_message', text="Нет активных рулеток для отмены.")
 
 # ---------- @рандом ----------
 @admin_router.message(F.text.regexp(r'@рандом\s+(.+)'))
@@ -489,11 +500,9 @@ async def random_cmd(message: types.Message, bot: Bot):
     await bot.send_photo(chat_id, photo=img_file)
     verify_link = f"https://t.me/{BOT_USERNAME}?start={verify_token}"
     enqueue(chat_id, 'send_message', text=f"🔒 Хеш: <code>{seed_hash}</code>\nSeed: <code>{seed}</code>\n🔍 Проверка: {verify_link}", parse_mode='HTML', disable_web_page_preview=True)
-    # Сохраняем рулетку без participants/winners в самом INSERT
     rid = save_roulette(chat_id, 'finished', 0, winners_count,
                         '', '', '', '', '', '', datetime.now(NOVOSIBIRSK), datetime.now(NOVOSIBIRSK),
                         seed=seed, seed_hash=seed_hash, verify_token=verify_token)
-    # Обновляем запись с participants и winners
     update_roulette(rid, participants_json=json.dumps(numbers),
                     winners_json=json.dumps([numbers.index(w) for w in winners]))
 
@@ -543,10 +552,10 @@ async def reroll_cmd(message: types.Message, bot: Bot):
             names.append(str(uid))
     winner_numbers_old = [i+1 for i in winners_idx]
     winner_numbers_new = [i+1 for i in final_winners]
-    # Определяем, какие старые номера лишены призов (те, что перекручены)
+    # Лишённые призов — те номера, которые перекрутили
     lost_numbers = [winner_numbers_old[n-1] for n in reroll]
-    # Создаём одну картинку перекрута
-    img_bytes = create_reroll_image(
+    # Генерируем две картинки
+    img_bytes_old, img_bytes_new = create_reroll_images(
         old_winners=winner_numbers_old,
         crossed=lost_numbers,
         new_winners=winner_numbers_new,
@@ -556,7 +565,9 @@ async def reroll_cmd(message: types.Message, bot: Bot):
         old_hash=last['seed_hash'],
         new_hash=seed_hash
     )
-    img_file = BufferedInputFile(img_bytes.read(), filename="reroll.png")
+    img_file_old = BufferedInputFile(img_bytes_old.read(), filename="old.png")
+    img_file_new = BufferedInputFile(img_bytes_new.read(), filename="new.png")
+
     prizes_raw = last['prizes'] or ''
     prizes_list = [p.strip() for p in prizes_raw.split('\n') if p.strip()] if prizes_raw else []
     new_winners_lines = []
@@ -569,6 +580,7 @@ async def reroll_cmd(message: types.Message, bot: Bot):
     if old_names:
         crossed = ", ".join(f"<s>{n}</s>" for n in old_names)
         caption_text += f"\nЛишились призов: {crossed}"
+
     result_template = last['result_msg']
     try:
         tmpl_data = json.loads(result_template)
@@ -581,7 +593,14 @@ async def reroll_cmd(message: types.Message, bot: Bot):
         full_caption = result_template.replace('{winners}', caption_text)
     if len(full_caption) > 1024:
         full_caption = full_caption[:1020] + "..."
-    await bot.send_photo(chat_id, photo=img_file, caption=full_caption, parse_mode='HTML')
+
+    # Отправляем две картинки с общей подписью
+    media = [
+        InputMediaPhoto(media=img_file_old, caption=full_caption, parse_mode='HTML'),
+        InputMediaPhoto(media=img_file_new)
+    ]
+    await bot.send_media_group(chat_id, media=media)
+
     verify_link = f"https://t.me/{BOT_USERNAME}?start={verify_token}"
     enqueue(chat_id, 'send_message', text=f"🔒 Хеш: <code>{seed_hash}</code>\nSeed: <code>{seed}</code>\n🔍 Проверка: {verify_link}", parse_mode='HTML', disable_web_page_preview=True)
     new_id = save_roulette(chat_id, 'finished', last['duration'], len(final_winners),
@@ -600,6 +619,9 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     roulette = get_roulette_by_id(rid)
     if not roulette or roulette['status'] != 'waiting_start':
         return
+    # Убираем задачу из словаря (если была запланирована)
+    scheduled_tasks.pop(rid, None)
+
     rules = roulette['rules']
     if rules:
         await send_template(bot, chat_id, rules, trigger=roulette['trigger'],
