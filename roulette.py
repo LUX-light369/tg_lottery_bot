@@ -256,7 +256,7 @@ filter_router = Router()
 # ---------- Reply‑клавиатура для обычных пользователей ----------
 def user_reply_kb():
     kb = ReplyKeyboardBuilder()
-    kb.button(text="🔍 Проверить результат")
+    kb.button(text="🔍 Ручная проверка")
     return kb.as_markup(resize_keyboard=True)
 
 # ---------- /start ----------
@@ -273,12 +273,12 @@ async def start_cmd(message: types.Message, bot: Bot, command: CommandObject = N
             await handle_verify_token(message, bot, token)
             return
     await message.answer(
-        "ℹ️ Я бот для честных рулеток. Для проверки результата нажмите кнопку ниже или используйте ссылку.",
+        "ℹ️ Я бот для проведения честных рулеток в чате ДРУЗЬЯ ТРЕНЕРА😎. Для ручной проверки результата нажмите кнопку внизу или используйте прямую ссылку на розыгрыш!",
         reply_markup=user_reply_kb()
     )
 
 # ---------- Обработка reply‑кнопки ----------
-@admin_router.message(lambda msg: msg.chat.type == 'private' and msg.text == "🔍 Проверить результат")
+@admin_router.message(lambda msg: msg.chat.type == 'private' and msg.text == "🔍 Ручная проверка")
 async def manual_verify_start(message: types.Message, state: FSMContext):
     if message.from_user.id == MAIN_ADMIN_ID:
         await message.answer("Админам не нужна проверка 😉")
@@ -302,7 +302,7 @@ async def process_seed(message: types.Message, state: FSMContext):
 async def process_hash(message: types.Message, state: FSMContext):
     await state.update_data(hash=message.text.strip())
     await message.answer(
-        "Введите список участников (каждый с новой строки, в порядке записи).\n"
+        "Введите список участников (каждый с новой строки, в порядке записи,без лишних строк,только номера и юзеры).\n"
         "Если это рандом, введите диапазон чисел, например: 1-90"
     )
     await state.set_state(VerifyForm.waiting_for_participants)
@@ -323,7 +323,7 @@ async def process_participants(message: types.Message, state: FSMContext):
     import hashlib
     computed_hash = hashlib.sha256(seed.encode()).hexdigest()
     if computed_hash != expected_hash:
-        await message.answer("❌ Хеш не совпадает! Результаты могли быть подделаны.", reply_markup=user_reply_kb())
+        await message.answer("❌ Хеш не совпадает! Результаты могли быть подделаны или вы ошиблись при вводе данных рулетки.", reply_markup=user_reply_kb())
         await state.clear()
         return
     await state.update_data(participants=participants, seed=seed)
@@ -409,7 +409,7 @@ async def roulette_cmd(message: types.Message, bot: Bot):
     display_prizes = prizes_list[:winners] if winners and prizes_list else prizes_list
     prizes_str = "\n<b>Призы:</b>\n" + "\n".join(f"• {p}" for p in display_prizes) if display_prizes else ""
     await send_template(bot, chat_id, announce_template,
-                        winners=str(winners) if winners else "определит админ",
+                        winners=str(winners) if winners else "вручную админ",
                         duration=str(duration),
                         start_time=start_time.strftime('%d.%m.%Y %H:%M'),
                         seed_hash=seed_hash,
@@ -504,7 +504,7 @@ async def random_cmd(message: types.Message, bot: Bot):
     img_file = BufferedInputFile(img_bytes.read(), filename="random.png")
     await bot.send_photo(chat_id, photo=img_file)
     verify_link = f"https://t.me/{BOT_USERNAME}?start={verify_token}"
-    enqueue(chat_id, 'send_message', text=f"🔒 Хеш: <code>{seed_hash}</code>\nSeed: <code>{seed}</code>\n🔍 Проверка: {verify_link}", parse_mode='HTML', disable_web_page_preview=True)
+    enqueue(chat_id, 'send_message', text=f"🔐 Хеш: <code>{seed_hash}</code>\n🔑 Seed: <code>{seed}</code>\n🔍 Проверка честности: {verify_link}", parse_mode='HTML', disable_web_page_preview=True)
     rid = save_roulette(chat_id, 'finished', 0, winners_count,
                         '', '', '', '', '', '', datetime.now(NOVOSIBIRSK), datetime.now(NOVOSIBIRSK),
                         seed=seed, seed_hash=seed_hash, verify_token=verify_token)
@@ -600,7 +600,7 @@ async def reroll_cmd(message: types.Message, bot: Bot):
     await bot.send_media_group(chat_id, media=media)
 
     verify_link = f"https://t.me/{BOT_USERNAME}?start={verify_token}"
-    enqueue(chat_id, 'send_message', text=f"🔒 Хеш: <code>{seed_hash}</code>\nSeed: <code>{seed}</code>\n🔍 Проверка: {verify_link}", parse_mode='HTML', disable_web_page_preview=True)
+    enqueue(chat_id, 'send_message', text=f"🔐 Хеш: <code>{seed_hash}</code>\n🔑 Seed: <code>{seed}</code>\n🔍 Проверка честности: {verify_link}", parse_mode='HTML', disable_web_page_preview=True)
     new_id = save_roulette(chat_id, 'finished', last['duration'], len(final_winners),
                            last['trigger'], prizes_raw, last['rules'], last['start_msg'],
                            last['stop_msg'], last['result_msg'], datetime.now(NOVOSIBIRSK),
@@ -661,7 +661,7 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
     enqueue(chat_id, 'send_message', text=f"📋 Участники ({len(valid_users)}):\n{participants_str_clean}")
     participants_str_with_at = "\n".join(f"{i+1}. {n}" for i, n in enumerate(names_with_at))
     try:
-        await bot.send_message(MAIN_ADMIN_ID, f"Список участников чата {chat_id}:\n{participants_str_with_at}")
+        await bot.send_message(MAIN_ADMIN_ID, f"Список участников в чате {chat_id}:\n{participants_str_with_at}")
     except:
         pass
 
@@ -696,12 +696,12 @@ async def start_recording(bot: Bot, chat_id: int, rid: int):
             full_caption = full_caption[:1020] + "..."
         await bot.send_photo(chat_id, photo=img_file, caption=full_caption, parse_mode='HTML')
         verify_link = f"https://t.me/{BOT_USERNAME}?start={roulette['verify_token']}"
-        enqueue(chat_id, 'send_message', text=f"🔒 Хеш: <code>{roulette['seed_hash']}</code>\nSeed: <code>{seed}</code>\n🔍 Проверка: {verify_link}", parse_mode='HTML', disable_web_page_preview=True)
+        enqueue(chat_id, 'send_message', text=f"🔐 Хеш: <code>{roulette['seed_hash']}</code>\n🔑 Seed: <code>{seed}</code>\n🔍 Проверка честности: {verify_link}", parse_mode='HTML', disable_web_page_preview=True)
         update_roulette(rid, status='finished', participants_json=json.dumps(valid_users),
                         winners_json=json.dumps([valid_users.index(u) for u in winners]))
     else:
         update_roulette(rid, status='finished', participants_json=json.dumps(valid_users))
-        enqueue(chat_id, 'send_message', text="Админ, проведите розыгрыш самостоятельно.")
+        enqueue(chat_id, 'send_message', text="Админ, крутани рандом самостоятельно.")
     for uid in session.muted_users:
         await unmute_user(bot, chat_id, uid)
     active_sessions.pop(chat_id, None)
@@ -726,10 +726,10 @@ async def filter_msg(message: types.Message, bot: Bot):
 
     if action == 'valid':
         if not await check_subscriptions(bot, user_id):
-            await message.reply("⚠️ Вы не подписаны на обязательные каналы. Подпишитесь до конца записи, иначе ваш голос не зачтётся.")
+            await message.reply("⚠️ Нет подписки на канал(-ы). Подпишись до конца записи, иначе запись не зачтётся.")
         return
     elif action == 'no_username':
-        await message.reply("⚠️ Нужен @username. Установите до конца записи.")
+        await message.reply("⚠️ Нет юзернейма. Установи до конца записи, иначе запись не зачтется.")
     elif action == 'disqualified':
         await message.delete()
         if trigger_to_delete:
@@ -740,7 +740,7 @@ async def filter_msg(message: types.Message, bot: Bot):
         await mute_user(bot, message.chat.id, user_id)
         session.muted_users.add(user_id)
         mention = f"@{username}" if username else message.from_user.full_name
-        enqueue(message.chat.id, 'send_message', text=f"⛔ {mention} дисквалифицирован.")
+        enqueue(message.chat.id, 'send_message', text=f"⛔ {mention} дисквалифицирован!")
     elif action == 'extra_ignored':
         await message.delete()
     elif action == 'ignored':
@@ -750,7 +750,7 @@ async def filter_msg(message: types.Message, bot: Bot):
         await mute_user(bot, message.chat.id, user_id)
         session.muted_users.add(user_id)
         mention = f"@{username}" if username else message.from_user.full_name
-        enqueue(message.chat.id, 'send_message', text=f"🚫 {mention}, вы забанены.")
+        enqueue(message.chat.id, 'send_message', text=f"🚫 {mention}, тебе нельзя участвовать в данной рулетке.")
 
 # ---------- Меню настроек ----------
 class SettingsForm(StatesGroup):
@@ -1120,12 +1120,12 @@ async def handle_verify_token(message: types.Message, bot: Bot, token: str):
         f"📅 Дата: {start_time}\n"
         f"👥 Участников: {len(participants)}\n"
         f"🎲 Победители: {', '.join(winners_names) if winners_names else 'нет'}\n\n"
-        f"🔒 <b>Seed (секретное число):</b> <code>{escape_html(seed)}</code>\n"
-        f"📝 <b>Хеш SHA256:</b> <code>{escape_html(seed_hash)}</code>\n\n"
+        f"🔑 <b>Seed (секретное число):</b> <code>{escape_html(seed)}</code>\n"
+        f"🔐 <b>Хеш SHA256:</b> <code>{escape_html(seed_hash)}</code>\n\n"
         "ℹ️ <b>Как проверить:</b>\n"
         "1. Убедитесь, что хеш совпадает с объявленным до начала розыгрыша.\n"
         "2. Перейдите на сайт https://emn178.github.io/online-tools/sha256.html и введите seed — получите хеш. Сравните.\n"
-        "3. Скопируйте и выполните код Python ниже — он выдаст победителей.\n\n"
+        "3. Скопируйте открытый исходный код рандома(seed и список подставлены) ниже и отправьте любой бесплатной нейросети(DeepSeek, ChatGPT, Алиса или др.) — они выдадут id победителей и могут подтвердить честность результата и подробно объяснить надежность.\n\n"
         "<b>Готовый код для проверки:</b>\n"
         f"<pre>{escape_html(python_code)}</pre>\n\n"
         "Если результат совпал — розыгрыш честный."
