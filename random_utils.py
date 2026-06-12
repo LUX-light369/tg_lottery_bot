@@ -17,7 +17,7 @@ def select_winners(participants: List[int], count: int, seed: str) -> List[int]:
     return [participants[i] for i in indices[:count]]
 
 def create_result_image(winners: List[int], total: int, dt: datetime, seed_hash: str) -> io.BytesIO:
-    return _create_base_image(winners, total, dt, seed_hash, "ЧЕСТНАЯ РУЛЕТКА")
+    return _create_base_image(winners, total, dt, seed_hash, "ПОБЕДИТЕЛИ РУЛЕТКИ")
 
 def create_random_image(winners: List[int], lo: int, hi: int, dt: datetime, seed_hash: str) -> io.BytesIO:
     return _create_base_image(winners, hi - lo + 1, dt, seed_hash, "СЛУЧАЙНЫЕ ЧИСЛА")
@@ -113,5 +113,5 @@ def get_verification_instruction(roulette_id: int, seed: str, participants: List
         f"1. Перейдите на https://emn178.github.io/online-tools/sha256.html\n"
         f"2. Введите seed: {seed}\n"
         f"3. Сверьте хеш с объявленным.\n"
-        "4. Используйте кнопку «Проверить результат» в ЛС бота или скопируйте код ниже."
+        "4. Используйте кнопку «Ручная проверка» в ЛС бота или прямую ссылку на результат рулетки."
     )
