@@ -40,7 +40,6 @@ async def main():
 
     init_db()
 
-    # Получаем username бота и передаём в roulette
     me = await bot.me()
     set_bot_username(me.username)
 
@@ -49,7 +48,10 @@ async def main():
     asyncio.create_task(queue_worker(bot))
     asyncio.create_task(clean_old_roulettes(bot))
 
-    # HTTP server
+    # Удаляем вебхук, чтобы освободить polling
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    # HTTP-сервер для health-check (требуется хостингом)
     app = web.Application()
     app.router.add_get("/", health_check)
     app.router.add_get("/health", health_check)
