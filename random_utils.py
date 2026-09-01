@@ -121,22 +121,22 @@ def _create_base_image(winners: List[int], total: int, dt: datetime, seed_hash: 
         COLOR_GOLD
     )
 
-    # ИЗМЕНЕНИЕ: Размер шрифта увеличен с 22 до 29
+    # ИЗМЕНЕНИЕ: Размер шрифта увеличен с 22 до 28
     try:
-        font_info = ImageFont.truetype("DejaVuSans.ttf", 29)
+        font_info = ImageFont.truetype("DejaVuSans.ttf", 28)
     except:
         font_info = ImageFont.load_default()
 
     # Диапазон участников
-    draw.text(CENTER_RANGE, f"от 1 до {total}", fill=COLOR_WHITE, font=font_info, anchor="mm")
+    draw.text(CENTER_RANGE, f"от 1 до {total}", fill=COLOR_GOLD, font=font_info, anchor="mm")
 
     # Дата и время
     time_str = dt.strftime("%d.%m.%Y %H:%M:%S")
-    draw.text(CENTER_TIME, time_str, fill=COLOR_WHITE, font=font_info, anchor="mm")
+    draw.text(CENTER_TIME, time_str, fill=COLOR_GOLD, font=font_info, anchor="mm")
 
     # Честность (Hash)
     hash_text = f"{seed_hash[:16]}..." 
-    draw.text(CENTER_HASH, hash_text, fill=COLOR_WHITE, font=font_info, anchor="mm")
+    draw.text(CENTER_HASH, hash_text, fill=COLOR_GOLD, font=font_info, anchor="mm")
 
     # ИЗМЕНЕНИЕ: Сохраняем PNG без сжатия, чтобы на выходе было максимальное качество
     buf = io.BytesIO()
