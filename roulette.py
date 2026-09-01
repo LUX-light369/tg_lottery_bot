@@ -1128,7 +1128,7 @@ async def handle_verify_token(message: types.Message, bot: Bot, token: str):
         "3. Скопируйте открытый исходный код рандома(seed и список подставлены) под этой инструкцией, откройте сайт любого онлайн компилятора Python кода, например https://online-python.netlify.app/.\n
         "4. Вставьте скопированный код и нажмите в левом верхнем углу зелёную кнопку ЗАПУСК,в графе ВЫВОД появиться результат рулетки. Сравните!\n\n"
         "<b>Готовый код для проверки:</b>\n"
-        f"<code><pre>{escape_html(python_code)}</pre>\n\n"
+        f"<pre>{escape_html(python_code)}</pre>\n\n"
         "<b>✅ Если результат совпал — розыгрыш честный!</b>"
     )
     await message.answer(report, parse_mode='HTML', reply_markup=user_reply_kb() if message.from_user.id != MAIN_ADMIN_ID else None)
