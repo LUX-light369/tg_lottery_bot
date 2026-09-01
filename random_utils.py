@@ -22,90 +22,128 @@ def create_result_image(winners: List[int], total: int, dt: datetime, seed_hash:
 def create_random_image(winners: List[int], lo: int, hi: int, dt: datetime, seed_hash: str) -> io.BytesIO:
     return _create_base_image(winners, hi - lo + 1, dt, seed_hash, "СЛУЧАЙНЫЕ ЧИСЛА")
 
-def _create_base_image(winners: List[int], total: int, dt: datetime, seed_hash: str, title: str) -> io.BytesIO:
-    W, H = 800, 600
-    bg = (15, 15, 35)
-    accent = (255, 215, 0)
-    white = (255, 255, 255)
 
-    img = Image.new('RGB', (W, H), bg)
-    draw = ImageDraw.Draw(img)
+def _draw_winners_adaptive(draw, winners: List[int], font_path: str, box_x: int, box_y: int, box_w: int, box_h: int, color):
+    """Рисует победителей в рамке, адаптируя шрифт и количество строк."""
+    if not winners:
+        draw.text((box_x + box_w // 2, box_y + box_h // 2), "Нет победителей", fill=color, font=ImageFont.load_default(), anchor="mm")
+        return
+
+    parts = [str(n) for n in winners]
+    count = len(parts)
+    max_lines_allowed = 6
+
+    for size in range(140, 14, -5):
+        try:
+            font = ImageFont.truetype(font_path, size)
+        except:
+            font = ImageFont.load_default()
+
+        for lines in range(1, min(count, max_lines_allowed) + 1):
+            base_count = count // lines
+            remainder = count % lines
+            text_lines = []
+            idx = 0
+            
+            for i in range(lines):
+                current_line_count = base_count + (1 if i < remainder else 0)
+                # ИЗМЕНЕНИЕ: " " заменено на " , " (2 пробела и запятая)
+                text_lines.append(", ".join(parts[idx:idx + current_line_count]))
+                idx += current_line_count
+
+            max_width = 0
+            total_height = 0
+            line_heights = []
+            spacing = 5
+
+            for line in text_lines:
+                bbox = draw.textbbox((0, 0), line, font=font)
+                width = bbox[2] - bbox[0]
+                height = bbox[3] - bbox[1]
+                max_width = max(max_width, width)
+                line_heights.append(height)
+                total_height += height
+
+            total_height += spacing * (len(text_lines) - 1)
+
+            if max_width <= box_w and total_height <= box_h:
+                # ИЗМЕНЕНИЕ: Добавлено "+ 44" в начало отрисовки, чтобы приспустить текст ниже
+                y_current = box_y + (box_h - total_height) // 2 + 44
+                x_center = box_x + box_w // 2
+
+                for i, line in enumerate(text_lines):
+                    draw.text((x_center, y_current), line, fill=color, font=font, anchor="mm")
+                    y_current += line_heights[i] + spacing
+                return
 
     try:
-        font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", 50)
-        font_info = ImageFont.truetype("DejaVuSans.ttf", 30)
-        font_small = ImageFont.truetype("DejaVuSans.ttf", 20)
+        fallback_font = ImageFont.truetype(font_path, 15)
     except:
-        font_title = ImageFont.load_default()
+        fallback_font = ImageFont.load_default()
+    
+    chunk_size = (len(parts) + 4) // 5
+    # ИЗМЕНЕНИЕ: ", " заменено на " " в запасном варианте
+    lines = [" ".join(parts[i:i+chunk_size]) for i in range(0, len(parts), chunk_size)]
+    combined_text = "\n".join(lines)
+    draw.multiline_text((box_x + box_w // 2, box_y + box_h // 2), combined_text, fill=color, font=fallback_font, anchor="mm", align="center")
+
+
+def _create_base_image(winners: List[int], total: int, dt: datetime, seed_hash: str, title: str) -> io.BytesIO:
+    TEMPLATE_FILE = "roulette_template.png"
+    FONT_WINNERS = "Pricedown.ttf"       
+    
+    # Координаты
+    BOX_WINNERS = {"x": 76,  "y": 373, "w": 662, "h": 198}
+    CENTER_RANGE = (604, 644)
+    CENTER_TIME  = (586, 735)
+    CENTER_HASH  = (571, 829)
+    
+    # Цвета
+    COLOR_GOLD = (212, 175, 55) 
+    COLOR_WHITE = (255, 255, 255)
+
+    try:
+        img = Image.open(TEMPLATE_FILE)
+    except FileNotFoundError:
+        img = Image.new('RGB', (1000, 667), (20, 30, 20))
+    
+    draw = ImageDraw.Draw(img)
+    
+    # Отрисовка победителей
+    _draw_winners_adaptive(
+        draw, 
+        winners, 
+        FONT_WINNERS, 
+        BOX_WINNERS["x"], 
+        BOX_WINNERS["y"], 
+        BOX_WINNERS["w"], 
+        BOX_WINNERS["h"], 
+        COLOR_GOLD
+    )
+
+    # ИЗМЕНЕНИЕ: Размер шрифта увеличен с 22 до 29
+    try:
+        font_info = ImageFont.truetype("DejaVuSans.ttf", 29)
+    except:
         font_info = ImageFont.load_default()
-        font_small = ImageFont.load_default()
 
-    draw.text((W/2, 70), title, fill=accent, font=font_title, anchor="mm")
+    # Диапазон участников
+    draw.text(CENTER_RANGE, f"от 1 до {total}", fill=COLOR_WHITE, font=font_info, anchor="mm")
 
-    # Форматируем номера с переносом, если >7
-    winners_text = _format_numbers(winners)
-    max_font_size = 80
-    min_font_size = 20
-    font_winners = None
-    fit_single_line = False
+    # Дата и время
+    time_str = dt.strftime("%d.%m.%Y %H:%M:%S")
+    draw.text(CENTER_TIME, time_str, fill=COLOR_WHITE, font=font_info, anchor="mm")
 
-    for size in range(max_font_size, min_font_size - 1, -10):
-        try:
-            font_winners = ImageFont.truetype("DejaVuSans-Bold.ttf", size)
-        except:
-            font_winners = ImageFont.load_default()
-        bbox = draw.textbbox((0, 0), winners_text, font=font_winners)
-        if bbox[2] - bbox[0] <= W - 40:
-            fit_single_line = True
-            break
+    # Честность (Hash)
+    hash_text = f"{seed_hash[:16]}..." 
+    draw.text(CENTER_HASH, hash_text, fill=COLOR_WHITE, font=font_info, anchor="mm")
 
-    if fit_single_line:
-        draw.text((W/2, 200), winners_text, fill=white, font=font_winners, anchor="mm")
-    else:
-        lines = _wrap_text(winners_text, font_winners, W - 40, draw)
-        y = 200
-        line_height = draw.textbbox((0, 0), "A", font=font_winners)[3] - draw.textbbox((0, 0), "A", font=font_winners)[1]
-        for line in lines:
-            draw.text((W/2, y), line, fill=white, font=font_winners, anchor="mm")
-            y += line_height + 10
-
-    draw.text((W/2, 300), f"Участников: 1 – {total}", fill=white, font=font_info, anchor="mm")
-    time_str = dt.strftime("%d.%m.%Y %H:%M:%S") + " (НСК)"
-    draw.text((W/2, 380), time_str, fill=white, font=font_info, anchor="mm")
-    draw.text((W/2, 460), f"Честность: SHA256 {seed_hash[:16]}...", fill=accent, font=font_small, anchor="mm")
-    draw.rectangle([20, 20, W-20, H-20], outline=accent, width=3)
-
+    # ИЗМЕНЕНИЕ: Сохраняем PNG без сжатия, чтобы на выходе было максимальное качество
     buf = io.BytesIO()
-    img.save(buf, format='PNG')
+    img.save(buf, format='PNG', compress_level=0)
     buf.seek(0)
     return buf
 
-def _format_numbers(numbers: List[int]) -> str:
-    """Форматирует числа с переносом строки, если их больше 7."""
-    parts = [str(n) for n in numbers]
-    if len(parts) <= 7:
-        return ", ".join(parts)
-    mid = (len(parts) + 1) // 2
-    line1 = ", ".join(parts[:mid])
-    line2 = ", ".join(parts[mid:])
-    return f"{line1}\n{line2}"
-
-def _wrap_text(text: str, font, max_width: int, draw) -> List[str]:
-    words = text.split(', ')
-    lines = []
-    current_line = ""
-    for word in words:
-        test_line = f"{current_line}, {word}" if current_line else word
-        bbox = draw.textbbox((0, 0), test_line, font=font)
-        if bbox[2] - bbox[0] <= max_width:
-            current_line = test_line
-        else:
-            if current_line:
-                lines.append(current_line)
-            current_line = word
-    if current_line:
-        lines.append(current_line)
-    return lines
 
 def get_verification_instruction(roulette_id: int, seed: str, participants: List[str], winners: List[str]) -> str:
     return (
